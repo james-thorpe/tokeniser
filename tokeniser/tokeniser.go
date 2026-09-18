@@ -161,11 +161,12 @@ func connect(sourceStates States, destStates States) {
 }
 
 func Compile(compiler Compiler) (start *State, end *State, meta *Metadata) {
+	// create default token with fixed Id(0).
 	token := &Token{Id: 0, Name: ""}
 	meta = &Metadata{states: States{}, tokens: Tokens{token}}
-	prevTail := Any()(meta, token, States{})
-	tail := Seq(compiler, rune(-1))(meta, token, prevTail)
-	return prevTail[0], tail[0], meta // prevTail and tail are guaranteed to only have one state
+	// append a start and end state to the grammar.  This makes Run() simpler
+	tail := Seq(Any(), compiler, rune(-1))(meta, token, States{})
+	return meta.states[0], tail[0], meta //
 }
 
 func Run(compiler Compiler, reader io.RuneReader) (tokens Tokens, err error) {
