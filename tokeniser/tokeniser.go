@@ -144,9 +144,9 @@ func connect(sourceStates States, destStates States) {
 
 func compile(compiler Compiler) (start *State, end *State, meta *Metadata) {
 	meta = &Metadata{states: States{}}
-	prevTail := Any()(meta, States{})
-	tail := Seq(compiler, rune(-1))(meta, prevTail)
-	return prevTail[0], tail[0], meta // prevTail and tail are guaranteed to only have one state
+	// append a start and end state to the grammar.  This makes Run() simpler
+	tail := Seq(Any(), compiler, rune(-1))(meta, States{})
+	return meta.states[0], tail[0], meta //
 }
 
 func Run(compiler Compiler, reader io.RuneReader) (err error) {
