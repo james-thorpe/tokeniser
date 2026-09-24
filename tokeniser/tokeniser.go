@@ -186,24 +186,30 @@ func Run(compiler Compiler, reader io.RuneReader) (tokens Tokens, err error) {
 		for _, state := range running { // for each running state .
 			for _, nextState := range state.nextStates {
 				if state.pos != pos && nextState.match(r) {
-
+					// update token value if nextState.token not the "default" token
+					if nextState.token.Id != 0 {
+						nextState.token.Value = append(nextState.token.Value, r)
+					}
 					// if token changes between state and nextState then process tokens
 					if state.token != nextState.token {
-						// return state.token if not the "default" token
-						if state.token.Id != 0 {
-							tokens = append(tokens, copyToken(state.token))
-						}
 						// record start of next token position
 						nextState.token.Pos = pos
+						// add previous token to tokens if not the "default" token
+						if state.token.Id != 0 {
+							tokens = append(tokens, copyToken(state.token))
+							// if we have just processed the final token then return the tokens.
+							if nextState == end {
+								return tokens, nil
+							}
+							// make nextState the only pending state to enforce token precedence
+							pending = States{nextState}
+							goto processPending
+						}
 					}
 					// if nextState == end then we must also be at the end of the input (r == -1)
 					// so we are all done.
 					if nextState == end {
 						return tokens, nil
-					}
-					// update token value if nextState.token not the "default" token
-					if nextState.token.Id != 0 {
-						nextState.token.Value = append(nextState.token.Value, r)
 					}
 					pending = append(pending, nextState)
 				}
@@ -218,6 +224,7 @@ func Run(compiler Compiler, reader io.RuneReader) (tokens Tokens, err error) {
 			return tokens, ErrGrammarMismatch
 		}
 		// swap running and pending states and clear the pending state for next iteration
+	processPending:
 		running, pending = pending, running
 		pending = pending[:0]
 		r, _, rerr = reader.ReadRune()
