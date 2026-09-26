@@ -108,19 +108,16 @@ func Test_Number(t *testing.T) {
 	// graph(decimal)
 }
 
-func Test_BasicOps(t *testing.T) {
-	/*
-	  String subset based on go grammar  https://go.dev/ref/spec#byte_value
-	*/
-	ops := Seq(Alt("abc", "abd"), OneOrMore("e", Optional('f'), 'g'))
-	graph(ops)
-}
-
 func Test_Define(t *testing.T) {
 	number := Define("number", OneOrMore(Range('0', '9')))
-	mul := Seq(number, OneOrMore(Define("mul", '*'), number))
-	testToken(t, "1*2*3", mul, []string{"1", "*", "2", "*", "3"})
-
+	mul := Define("*", '*')
+	div := Define("/", '/')
+	add := Define("+", '+')
+	sub := Define("-", '-')
+	op := Alt(mul, div, add, sub)
+	calc := Seq(number, op, number)
+	testToken(t, "1*2", calc, []string{"1", "*", "2"})
+	graph(calc)
 }
 
 func test(t *testing.T, input string, exp Compiler) Tokens {
