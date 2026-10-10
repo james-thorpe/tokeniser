@@ -9,10 +9,12 @@ import (
 
 type Tokens []*Token
 type Token struct {
-	Id    int    // Id of token
-	Name  string // Name of token
-	Pos   int    // position of the start of token (in runes, 0-based)
-	Value []rune // the Value of token
+	Id      int    // Id of token
+	Name    string // Name of token
+	Pos     int    // absolute position of the start of token (in runes, 0-based)
+	Line    int    // line of the start of token ('\n' delimits lines)
+	LinePos int    // position within the line of the start of a token (in runes, 1-based)
+	Value   string // the Value of token
 }
 
 // Matcher returns true to indicate that a transition is valid for the rune r
@@ -60,7 +62,7 @@ func MatchRune(rn rune) Compiler {
 func MatchString(text string) Compiler {
 	runes := []rune(text)
 	if len(runes) == 0 {
-		// an empty string matches nothing, so leave prevTail unchanged
+		// an empty string matches nothing, so leave prevTail unchanged (no states created)
 		return func(sm *StateMachine, token *Token, prevTail states) states { return prevTail }
 	}
 	children := make([]Compiler, len(runes))
@@ -206,35 +208,57 @@ func Compile(compiler Compiler) *StateMachine {
 }
 
 // tokenReader wraps an io.RuneReader and converts io.EOF into rune -1, which is how the end of
-// input is signalled to the state machine.
+// input is signalled to the state machine.  It tracks the position of the rune most recently read.
 type tokenReader struct {
-	io.RuneReader
+	reader  io.RuneReader
+	pos     int  // position of the rune in the input (in runes, 0-based)
+	line    int  // line of the rune (1-based)
+	linePos int  // position of the rune within its line (in runes, 1-based)
+	newLine bool // the previous rune was '\n', so the next rune starts a new line
 }
 
-func (e tokenReader) ReadRune() (r rune, size int, err error) {
-	r, size, err = e.RuneReader.ReadRune()
-	if err == io.EOF {
-		return -1, 0, nil
+func wrapRuneReader(reader io.RuneReader) tokenReader {
+	return tokenReader{reader: reader, pos: -1, line: 1, linePos: 0}
+}
+
+func (tr *tokenReader) readRune() (r rune, err error) {
+	r, _, err = tr.reader.ReadRune()
+	// the end of input (-1) also has a position, one after the last rune
+	tr.pos++
+	if tr.newLine {
+		tr.line++
+		tr.linePos = 1
+	} else {
+		tr.linePos++
 	}
-	return r, size, err
+	if err == io.EOF {
+		return -1, nil
+	}
+	tr.newLine = r == '\n'
+	return r, err
 }
 
-// Reset clears the matching state left behind by a previous Run.
+// startToken records the position of the rune most recently read as the start of token
+func (tr *tokenReader) startToken(token *Token) {
+	token.Pos, token.Line, token.LinePos = tr.pos, tr.line, tr.linePos
+}
+
+// Reset clears the running state left behind by a previous Run to allow reuse of the state machine.
 func (sm *StateMachine) reset() {
 	if sm.stale {
 		for _, state := range sm.states {
 			state.pos = -1
 		}
 		for _, token := range sm.tokens {
-			token.Pos = 0
-			token.Value = nil
+			token.Pos, token.Line, token.LinePos = 0, 0, 0
+			token.Value = ""
 		}
 		sm.stale = false
 	}
 }
 
-// Run tokenises input using the grammar compiled into sm.  Run is not safe for concurrent use
-// on the same StateMachine.
+// Run tokenises input using the grammar compiled into the StateMachine.  Run is not thread-safe but
+// is safe for reuse otherwise
 func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 	sm.reset()
 	sm.stale = true
@@ -245,35 +269,33 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 	tokens = make(Tokens, 0, 8)
 	running = append(running, sm.start) // set start state
 
-	input = tokenReader{input}
-
-	for pos := 0; ; pos++ {
-		r, _, readErr := input.ReadRune()
+	reader := wrapRuneReader(input)
+	r, readErr := reader.readRune()
+	for {
 		if readErr != nil {
 			return nil, readErr
 		}
 		buffer = append(buffer, r)
 		for _, state := range running {
 			for _, nextState := range state.nextStates {
-				if nextState.pos != pos && nextState.match(r) {
-					nextState.pos = pos
-					// if token changes between state, or we are looping backward on an extrinsic transition,
-					// then we have finished a token and started a new one.
+				if nextState.pos != reader.pos && nextState.match(r) {
+					nextState.pos = reader.pos
+					// if token changes between state, or we are transitioning on an extrinsic transition,
+					// then we have finished a token and are starting a new one.
 					if state.token != nextState.token || !nextState.internal {
 						// add previous token to tokens if not the "default" token
 						if state.token.Id != 0 {
-							// full slice expression stops appends to Value overwriting the buffer
-							from, to := state.token.Pos-bufferPos, pos-bufferPos
-							state.token.Value = buffer[from:to:to]
+							from, to := state.token.Pos-bufferPos, reader.pos-bufferPos
+							state.token.Value = string(buffer[from:to])
 							tokens = append(tokens, CopyToken(state.token))
 							// no running state can refer to input before pos so discard it
 							buffer = buffer[to:]
-							bufferPos = pos
+							bufferPos = reader.pos
 							// if we have just processed the final state then return the tokens.
 							if nextState == sm.end {
 								return tokens, nil
 							}
-							nextState.token.Pos = pos
+							reader.startToken(nextState.token)
 							// make nextState the only pending state to enforce token precedence
 							// don't bother processing further states
 							pending = append(pending[:0], nextState)
@@ -281,7 +303,7 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 						}
 						// single character loops have state == nextState, so we cannot update nextState.token.pos
 						// until end of token processing is complete
-						nextState.token.Pos = pos
+						reader.startToken(nextState.token)
 					}
 					// if nextState == end then we must also be at the end of the input (r == -1)
 					// so we are all done.
@@ -304,15 +326,13 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 	processPending:
 		running, pending = pending, running
 		pending = pending[:0]
-		if r == -1 {
-			return nil, nil
-		}
+		r, readErr = reader.readRune()
 	}
 }
 
 func CopyToken(token *Token) *Token {
-	t := &Token{Id: token.Id, Name: token.Name, Pos: token.Pos, Value: token.Value}
-	token.Value = nil
-	token.Pos = 0
-	return t
+	t := *token
+	token.Value = ""
+	token.Pos, token.Line, token.LinePos = 0, 0, 0
+	return &t
 }

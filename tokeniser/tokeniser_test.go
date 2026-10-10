@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -323,10 +324,10 @@ func Test_TokenBoundary(t *testing.T) {
 	if len(tokens) != 2 || tokens[0].Name != "a" || tokens[1].Name != "b" {
 		t.Fatalf("expected tokens a and b, got %v", newToks(tokens))
 	}
-	if value := string(tokens[0].Value) + string(tokens[1].Value); value != "xxx" {
+	if value := tokens[0].Value + tokens[1].Value; value != "xxx" {
 		t.Errorf("expected token values to add up to %q, got %v", "xxx", newToks(tokens))
 	}
-	if expected := len(tokens[0].Value); tokens[1].Pos != expected {
+	if expected := utf8.RuneCountInString(tokens[0].Value); tokens[1].Pos != expected {
 		t.Errorf("expected token b at position %d, got %v", expected, newToks(tokens))
 	}
 }
@@ -378,6 +379,40 @@ func mismatch(input string) result { return result{input, ErrGrammarMismatch} }
 
 // eoi expects input to end before the grammar does
 func eoi(input string) result { return result{input, ErrUnexpectedEOI} }
+
+// tokens record the line (1-based) and position within the line (in runes, 1-based) of their first rune
+func Test_TokenLines(t *testing.T) {
+	word := Define("word", OneOrMore(Range('a', 'z')))
+	exp := ZeroOrMore(Alt(word, Define("é", 'é'), OneOf(" \n")))
+	type pos struct {
+		value         string
+		pos           int
+		line, linePos int
+	}
+	inputs := []struct {
+		input    string
+		expected []pos
+	}{
+		{"ab cd", []pos{{"ab", 0, 1, 1}, {"cd", 3, 1, 4}}},
+		{"ab\ncd\n\n ef", []pos{{"ab", 0, 1, 1}, {"cd", 3, 2, 1}, {"ef", 8, 4, 2}}},
+		{"\nab\n", []pos{{"ab", 1, 2, 1}}},
+		{"éé x", []pos{{"é", 0, 1, 1}, {"é", 1, 1, 2}, {"x", 3, 1, 4}}}, // positions count runes, not bytes
+	}
+	for _, in := range inputs {
+		tokens, err := run(t, in.input, exp)
+		if err != nil {
+			t.Errorf("%q: expected no error, got %v", in.input, err)
+			continue
+		}
+		got := make([]pos, len(tokens))
+		for i, token := range tokens {
+			got[i] = pos{token.Value, token.Pos, token.Line, token.LinePos}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(in.expected) {
+			t.Errorf("%q: expected tokens %v, got %v", in.input, in.expected, got)
+		}
+	}
+}
 
 // a compiled StateMachine can be run many times, including after a failed run
 func Test_Reuse(t *testing.T) {
@@ -459,7 +494,7 @@ func (k tok) String() string {
 }
 
 func newTok(token *Token) tok {
-	return tok{token.Name, token.Pos, string(token.Value)}
+	return tok{token.Name, token.Pos, token.Value}
 }
 
 func newToks(tokens Tokens) []tok {
