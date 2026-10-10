@@ -15,6 +15,7 @@ type Token struct {
 	Line    int    // line of the start of token ('\n' delimits lines)
 	LinePos int    // position within the line of the start of a token (in runes, 1-based)
 	Value   string // the Value of token
+	Error   error  // if not nil, the token reports an error at its position instead of matched input
 }
 
 // Matcher returns true to indicate that a transition is valid for the rune r
@@ -31,15 +32,15 @@ type state struct {
 	internal    bool    // indicates an internal path from another state in the same token
 }
 
-type Compiler func(sm *StateMachine, token *Token, prevTail states) states
+type Compiler func(machine *StateMachine, token *Token, prevTail states) states
 
 var ErrUnexpectedEOI = errors.New("unexpected end of input")
 var ErrGrammarMismatch = errors.New("input does not match grammar")
 
 func Match(matcher Matcher, description string) Compiler {
-	return func(sm *StateMachine, token *Token, prevTail states) states {
+	return func(machine *StateMachine, token *Token, prevTail states) states {
 		state := &state{
-			id:          len(sm.states),
+			id:          len(machine.states),
 			description: description,
 			nextStates:  states{},
 			match:       matcher,
@@ -48,7 +49,7 @@ func Match(matcher Matcher, description string) Compiler {
 			internal:    false,
 		}
 		connect(prevTail, states{state}, token)
-		sm.states = append(sm.states, state)
+		machine.states = append(machine.states, state)
 		return states{state}
 	}
 }
@@ -63,7 +64,7 @@ func MatchString(text string) Compiler {
 	runes := []rune(text)
 	if len(runes) == 0 {
 		// an empty string matches nothing, so leave prevTail unchanged (no states created)
-		return func(sm *StateMachine, token *Token, prevTail states) states { return prevTail }
+		return func(machine *StateMachine, token *Token, prevTail states) states { return prevTail }
 	}
 	children := make([]Compiler, len(runes))
 	for i, r := range runes {
@@ -91,9 +92,9 @@ func Range(low, high rune) Compiler {
 // At least one compiler is required.
 func Seq[T CompilerTypes](first T, rest ...T) Compiler {
 	compilers := append([]T{first}, rest...)
-	return func(sm *StateMachine, token *Token, prevTail states) states {
+	return func(machine *StateMachine, token *Token, prevTail states) states {
 		for _, compiler := range compilers {
-			prevTail = convertToCompiler(compiler)(sm, token, prevTail) // tail = prevTail for each iteration
+			prevTail = convertToCompiler(compiler)(machine, token, prevTail) // tail = prevTail for each iteration
 		}
 		return prevTail
 	}
@@ -102,8 +103,8 @@ func Seq[T CompilerTypes](first T, rest ...T) Compiler {
 // Optional is a Seq with a bypass path that allows the state machine to skip over the sequence.
 // At least one compiler is required.
 func Optional[T CompilerTypes](first T, rest ...T) Compiler {
-	return func(sm *StateMachine, token *Token, prevTail states) states {
-		tail := Seq(first, rest...)(sm, token, prevTail)
+	return func(machine *StateMachine, token *Token, prevTail states) states {
+		tail := Seq(first, rest...)(machine, token, prevTail)
 		return slices.Concat(prevTail, tail) // add prevTail to tail to create bypass path (cannot use append)
 	}
 }
@@ -111,9 +112,9 @@ func Optional[T CompilerTypes](first T, rest ...T) Compiler {
 // OneOrMore creates a sequence of compilers that optionally loops back to the head.
 // At least one compiler is required.
 func OneOrMore[T CompilerTypes](first T, rest ...T) Compiler {
-	return func(sm *StateMachine, token *Token, prevTail states) states {
+	return func(machine *StateMachine, token *Token, prevTail states) states {
 		firstHeadIx := len(prevTail[0].nextStates) // identify no. of pre-existing transitions
-		tail := Seq(first, rest...)(sm, token, prevTail)
+		tail := Seq(first, rest...)(machine, token, prevTail)
 		head := prevTail[0].nextStates[firstHeadIx:] // get new transitions as the head of this fragment
 		connect(tail, head, token)                   // loop back to the head
 		return tail
@@ -130,10 +131,10 @@ func ZeroOrMore[T CompilerTypes](first T, rest ...T) Compiler {
 // At least one alternative is required.
 func Alt[T CompilerTypes](first T, rest ...T) Compiler {
 	rest = append([]T{first}, rest...)
-	return func(sm *StateMachine, token *Token, prevTail states) states {
+	return func(machine *StateMachine, token *Token, prevTail states) states {
 		tail := states{}
 		for _, alt := range rest {
-			altTail := convertToCompiler(alt)(sm, token, prevTail)
+			altTail := convertToCompiler(alt)(machine, token, prevTail)
 			tail = append(tail, altTail...)
 		}
 		return tail
@@ -143,10 +144,10 @@ func Alt[T CompilerTypes](first T, rest ...T) Compiler {
 // Define associates a token with all states within the scope of the definition.
 // At least one compiler is required.
 func Define[T CompilerTypes](tokenName string, first T, rest ...T) Compiler {
-	return func(sm *StateMachine, token *Token, prevTail states) states {
-		deftoken := &Token{Name: tokenName, Id: len(sm.tokens)}
-		sm.tokens = append(sm.tokens, deftoken)
-		tail := Seq(first, rest...)(sm, deftoken, prevTail)
+	return func(machine *StateMachine, token *Token, prevTail states) states {
+		deftoken := &Token{Name: tokenName, Id: len(machine.tokens)}
+		machine.tokens = append(machine.tokens, deftoken)
+		tail := Seq(first, rest...)(machine, deftoken, prevTail)
 		return tail
 	}
 }
@@ -200,15 +201,16 @@ type StateMachine struct {
 func Compile(compiler Compiler) *StateMachine {
 	// Create default token with Id = 0.
 	token := &Token{Id: 0, Name: ""}
-	sm := &StateMachine{states: states{}, tokens: Tokens{token}}
+	machine := &StateMachine{states: states{}, tokens: Tokens{token}}
 	// Add a start and end state to the grammar.  This reduces the conditional logic in Run().
-	tail := Seq(Any(), compiler, MatchRune(-1))(sm, token, states{})
-	sm.start, sm.end = sm.states[0], tail[0]
-	return sm
+	tail := Seq(Any(), compiler, MatchRune(-1))(machine, token, states{})
+	machine.start, machine.end = machine.states[0], tail[0]
+	return machine
 }
 
-// tokenReader wraps an io.RuneReader and converts io.EOF into rune -1, which is how the end of
-// input is signalled to the state machine.  It tracks the position of the rune most recently read.
+// tokenReader wraps an io.RuneReader and converts io.EOF into rune -1 which simplifies the Run() logic.
+// tokenReader tracks the position of each rune by absolute position and by line
+// The line tracking is a convenience for text editor review of the input
 type tokenReader struct {
 	reader  io.RuneReader
 	pos     int  // position of the rune in the input (in runes, 0-based)
@@ -217,8 +219,8 @@ type tokenReader struct {
 	newLine bool // the previous rune was '\n', so the next rune starts a new line
 }
 
-func wrapRuneReader(reader io.RuneReader) tokenReader {
-	return tokenReader{reader: reader, pos: -1, line: 1, linePos: 0}
+func wrapRuneReader(reader io.RuneReader) *tokenReader {
+	return &tokenReader{reader: reader, pos: -1, line: 1, linePos: 0}
 }
 
 func (tr *tokenReader) readRune() (r rune, err error) {
@@ -238,42 +240,31 @@ func (tr *tokenReader) readRune() (r rune, err error) {
 	return r, err
 }
 
-// startToken records the position of the rune most recently read as the start of token
-func (tr *tokenReader) startToken(token *Token) {
-	token.Pos, token.Line, token.LinePos = tr.pos, tr.line, tr.linePos
-}
-
-// Reset clears the running state left behind by a previous Run to allow reuse of the state machine.
-func (sm *StateMachine) reset() {
-	if sm.stale {
-		for _, state := range sm.states {
-			state.pos = -1
-		}
-		for _, token := range sm.tokens {
-			token.Pos, token.Line, token.LinePos = 0, 0, 0
-			token.Value = ""
-		}
-		sm.stale = false
-	}
-}
-
 // Run tokenises input using the grammar compiled into the StateMachine.  Run is not thread-safe but
-// is safe for reuse otherwise
-func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
-	sm.reset()
-	sm.stale = true
+// is safe for reuse otherwise.
+// If the input cannot be tokenised, the tokens matched so far are returned followed by an error token
+// whose Error field holds the error and whose position is where the error occurred.
+func (machine *StateMachine) Run(input io.RuneReader) (tokens Tokens) {
+	machine.reset()
+	machine.stale = true
 	running := make(states, 0, 8) // states that are being matched against the current rune
 	pending := make(states, 0, 8) // states that will be matched against the next rune
 	buffer := make([]rune, 0, 64) // runes read since bufferPos, used to build token values
 	bufferPos := 0                // position in the input of buffer[0]
 	tokens = make(Tokens, 0, 8)
-	running = append(running, sm.start) // set start state
+	running = append(running, machine.start) // set start state
 
 	reader := wrapRuneReader(input)
+	// errorToken appends a token reporting err at the position of the rune most recently read
+	errorToken := func(err error) Tokens {
+		token := &Token{Error: err}
+		startToken(reader, token)
+		return append(tokens, token)
+	}
 	r, readErr := reader.readRune()
 	for {
 		if readErr != nil {
-			return nil, readErr
+			return errorToken(readErr)
 		}
 		buffer = append(buffer, r)
 		for _, state := range running {
@@ -292,10 +283,10 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 							buffer = buffer[to:]
 							bufferPos = reader.pos
 							// if we have just processed the final state then return the tokens.
-							if nextState == sm.end {
-								return tokens, nil
+							if nextState == machine.end {
+								return tokens
 							}
-							reader.startToken(nextState.token)
+							startToken(reader, nextState.token)
 							// make nextState the only pending state to enforce token precedence
 							// don't bother processing further states
 							pending = append(pending[:0], nextState)
@@ -303,12 +294,12 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 						}
 						// single character loops have state == nextState, so we cannot update nextState.token.pos
 						// until end of token processing is complete
-						reader.startToken(nextState.token)
+						startToken(reader, nextState.token)
 					}
 					// if nextState == end then we must also be at the end of the input (r == -1)
 					// so we are all done.
-					if nextState == sm.end {
-						return tokens, nil
+					if nextState == machine.end {
+						return tokens
 					}
 					pending = append(pending, nextState)
 				}
@@ -316,11 +307,11 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 		}
 		// if r == -1 then we are at the end of the file but not the end of the grammar
 		if r == -1 {
-			return nil, ErrUnexpectedEOI
+			return errorToken(ErrUnexpectedEOI)
 		}
 		// no valid pending states ... so exit with error
 		if len(pending) == 0 {
-			return tokens, ErrGrammarMismatch
+			return errorToken(ErrGrammarMismatch)
 		}
 		// swap running and pending states and clear the pending state for next iteration
 	processPending:
@@ -330,9 +321,33 @@ func (sm *StateMachine) Run(input io.RuneReader) (tokens Tokens, err error) {
 	}
 }
 
+// Reset clears the running state left behind by a previous Run to allow reuse of the state machine.
+func (machine *StateMachine) reset() {
+	if machine.stale {
+		for _, state := range machine.states {
+			state.pos = -1
+		}
+		for _, token := range machine.tokens {
+			token.Pos, token.Line, token.LinePos = 0, 0, 0
+			token.Value = ""
+		}
+		machine.stale = false
+	}
+}
+
+// startToken records the position of the rune most recently read as the start of token
+func startToken(tr *tokenReader, token *Token) {
+	token.Pos, token.Line, token.LinePos = tr.pos, tr.line, tr.linePos
+}
+
 func CopyToken(token *Token) *Token {
-	t := *token
-	token.Value = ""
-	token.Pos, token.Line, token.LinePos = 0, 0, 0
-	return &t
+	return &Token{
+		Id:      token.Id,
+		Name:    token.Name,
+		Pos:     token.Pos,
+		Line:    token.Line,
+		LinePos: token.LinePos,
+		Value:   token.Value,
+		Error:   token.Error,
+	}
 }

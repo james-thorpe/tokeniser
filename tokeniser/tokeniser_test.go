@@ -348,17 +348,67 @@ func Test_TokenEndOfInput(t *testing.T) {
 // ---------------------------------------------------------------------------------------------------------------------
 
 func Test_ErrorTokens(t *testing.T) {
-	// tokens completed before a mismatch are returned with the error
-	tokens, err := run(t, "12*x", calc())
-	if !errors.Is(err, ErrGrammarMismatch) {
-		t.Errorf("expected error: %v, got %v", ErrGrammarMismatch, err)
+	type errTok struct {
+		err           error
+		pos           int
+		line, linePos int
 	}
-	if len(tokens) == 0 {
-		t.Errorf("expected the completed number token to be returned with the error")
-	} else if first := newTok(tokens[0]); first != (tok{"number", 0, "12"}) {
-		t.Errorf("expected first token %v, got %v", tok{"number", 0, "12"}, first)
+	inputs := []struct {
+		input     string
+		completed []tok  // tokens completed before the error
+		err       errTok // the error token, which is always last
+	}{
+		// a mismatch is reported at the rune that does not match
+		// (a token completes when the next rune matches, so mul is not completed)
+		{"12*x", []tok{{"number", 0, "12"}}, errTok{ErrGrammarMismatch, 3, 1, 4}},
+		{"x", nil, errTok{ErrGrammarMismatch, 0, 1, 1}},
+		// the end of input is reported one position after the last rune
+		{"12*", []tok{{"number", 0, "12"}}, errTok{ErrUnexpectedEOI, 3, 1, 4}},
+		{"", nil, errTok{ErrUnexpectedEOI, 0, 1, 1}},
 	}
-	testInputs(t, calc(), eoi("12*"))
+	for _, in := range inputs {
+		tokens := Compile(calc()).Run(strings.NewReader(in.input))
+		if len(tokens) == 0 || tokens[len(tokens)-1].Error == nil {
+			t.Errorf("%q: expected an error token last, got %v", in.input, newToks(tokens))
+			continue
+		}
+		last := tokens[len(tokens)-1]
+		if got := (errTok{last.Error, last.Pos, last.Line, last.LinePos}); got != in.err {
+			t.Errorf("%q: expected error token %v, got %v", in.input, in.err, got)
+		}
+		if last.Value != "" {
+			t.Errorf("%q: expected error token to have no value, got %q", in.input, last.Value)
+		}
+		for _, token := range tokens[:len(tokens)-1] {
+			if token.Error != nil {
+				t.Errorf("%q: expected only the last token to have an error, got %v", in.input, newToks(tokens))
+			}
+		}
+		if got, want := fmt.Sprint(newToks(tokens[:len(tokens)-1])), fmt.Sprint(in.completed); got != want {
+			t.Errorf("%q: expected completed tokens %s, got %s", in.input, want, got)
+		}
+	}
+
+	// errors from the reader are reported as error tokens at the position of the failed read
+	readErr := errors.New("read failed")
+	tokens := Compile(calc()).Run(&failingReader{strings.NewReader("12"), readErr})
+	if len(tokens) != 1 || !errors.Is(tokens[0].Error, readErr) || tokens[0].Pos != 2 {
+		t.Errorf("expected a single error token %q at position 2, got %+v", readErr, tokens)
+	}
+}
+
+// failingReader returns err once the underlying reader is exhausted, instead of io.EOF
+type failingReader struct {
+	reader io.RuneReader
+	err    error
+}
+
+func (f *failingReader) ReadRune() (rune, int, error) {
+	r, size, err := f.reader.ReadRune()
+	if err == io.EOF {
+		return 0, 0, f.err
+	}
+	return r, size, err
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -416,7 +466,7 @@ func Test_TokenLines(t *testing.T) {
 
 // a compiled StateMachine can be run many times, including after a failed run
 func Test_Reuse(t *testing.T) {
-	sm := Compile(lexer())
+	machine := Compile(lexer())
 	inputs := []struct {
 		input    string
 		err      error
@@ -428,7 +478,7 @@ func Test_Reuse(t *testing.T) {
 		{"ab 12", nil, []tok{{"ident", 0, "ab"}, {"number", 3, "12"}}},
 	}
 	for _, in := range inputs {
-		tokens, err := sm.Run(strings.NewReader(in.input))
+		tokens, err := splitError(machine.Run(strings.NewReader(in.input)))
 		if !errors.Is(err, in.err) {
 			t.Errorf("%q: expected error %v, got %v", in.input, in.err, err)
 			continue
@@ -479,7 +529,15 @@ func run(t *testing.T, input string, exp Compiler) (tokens Tokens, err error) {
 			tokens, err = nil, fmt.Errorf("panic: %v", r)
 		}
 	}()
-	return Compile(exp).Run(strings.NewReader(input))
+	return splitError(Compile(exp).Run(strings.NewReader(input)))
+}
+
+// splitError removes a trailing error token, returning the error it reports
+func splitError(tokens Tokens) (Tokens, error) {
+	if len(tokens) == 0 || tokens[len(tokens)-1].Error == nil {
+		return tokens, nil
+	}
+	return tokens[:len(tokens)-1], tokens[len(tokens)-1].Error
 }
 
 // tok is the expected name, position and value of a token
@@ -537,16 +595,16 @@ func graph(exp Compiler) {
 
 // Graph output state machine in GraphViz 'dot' format
 func Graph(writer io.Writer, compiler Compiler) {
-	sm := Compile(compiler)
+	machine := Compile(compiler)
 	// group states by token id
 	tokenStates := map[int]states{}
-	for _, state := range sm.states {
+	for _, state := range machine.states {
 		tokenStates[state.token.Id] = append(tokenStates[state.token.Id], state)
 	}
 
 	_, _ = fmt.Fprintf(writer, "digraph {\n  rankdir=LR;\n  node [fixedsize=true];\n")
 	// render the nodes
-	for _, token := range sm.tokens {
+	for _, token := range machine.tokens {
 		if token.Id > 0 {
 			_, _ = fmt.Fprintf(writer,
 				"subgraph cluster_%d {\n  label=\"%s\";\n  color=blue;\n  fontcolor=blue;\n",
@@ -554,7 +612,7 @@ func Graph(writer io.Writer, compiler Compiler) {
 		}
 		states := tokenStates[token.Id]
 		for _, state := range states {
-			if state == sm.start || state == sm.end {
+			if state == machine.start || state == machine.end {
 				_, _ = fmt.Fprintf(writer, "  %d [shape=\"doublecircle\"];\n", state.id)
 			} else {
 				_, _ = fmt.Fprintf(writer, "  %d [shape=\"circle\"];\n", state.id)
@@ -565,13 +623,13 @@ func Graph(writer io.Writer, compiler Compiler) {
 		}
 	}
 	// render the transitions
-	for _, state := range sm.states {
+	for _, state := range machine.states {
 		for _, nextState := range state.nextStates {
 			colour := "blue"
 			if state.token != nextState.token || !nextState.internal {
 				colour = "red"
 			}
-			if nextState == sm.end {
+			if nextState == machine.end {
 				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, color=%s, label=\"δ\"];\n", state.id, nextState.id, colour)
 			} else {
 				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, color=%s, label=\"%s\"];\n", state.id, nextState.id, colour, nextState.description)
