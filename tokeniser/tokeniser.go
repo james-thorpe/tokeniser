@@ -82,7 +82,7 @@ func Any() Compiler {
 
 // OneOf returns true if an input rune is found in a string
 func OneOf(options string) Compiler {
-	return Match(func(r rune) bool { return strings.ContainsRune(options, r) }, options)
+	return Match(func(r rune) bool { return strings.ContainsRune(options, r) }, "["+options+"]")
 }
 
 // Range returns true if an input rune is between low and high inclusive
@@ -260,6 +260,7 @@ func (machine *StateMachine) Run(input io.RuneReader) iter.Seq[*Token] {
 				yield(errorToken(reader, readErr))
 				return
 			}
+			tokenReturned := false
 			for _, state := range running {
 				for _, nextState := range state.nextStates {
 					if nextState.pos != reader.pos && nextState.match(r) {
@@ -273,6 +274,7 @@ func (machine *StateMachine) Run(input io.RuneReader) iter.Seq[*Token] {
 								if !yield(copyToken(state.token)) {
 									return
 								}
+								tokenReturned = true
 								pending = pending[:0] // clear pending state
 							}
 							// start next token
@@ -285,9 +287,13 @@ func (machine *StateMachine) Run(input io.RuneReader) iter.Seq[*Token] {
 							return
 						}
 						pending = append(pending, nextState)
+						if tokenReturned {
+							goto nextInput
+						}
 					}
 				}
 			}
+		nextInput:
 			buffer = append(buffer, r)
 
 			// if r == -1 then we are at the end of the file but not the end of the grammar
