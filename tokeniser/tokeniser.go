@@ -39,64 +39,6 @@ type Compiler func(machine *StateMachine, token *Token, prevTail states) states
 var ErrUnexpectedEOI = errors.New("unexpected end of input")
 var ErrGrammarMismatch = errors.New("input does not match grammar")
 
-// TokenError is an error that occurred while running the state machine.  It wraps Err, which is
-// ErrGrammarMismatch or ErrUnexpectedEOI, so errors.Is(err, Err) is true.
-type TokenError struct {
-	Err       error    // ErrGrammarMismatch or ErrUnexpectedEOI
-	Rune      rune     // the rune that did not match (-1 at the end of input)
-	TokenName string   // name of the token being processed, or "" if no token was being processed
-	Expected  []string // descriptions of the runes that would have matched
-}
-
-func (e *TokenError) Error() string {
-	var message strings.Builder
-	if errors.Is(e.Err, ErrUnexpectedEOI) {
-		message.WriteString("unexpected end of input")
-	} else {
-		fmt.Fprintf(&message, "unexpected rune %q", e.Rune)
-	}
-	if e.TokenName != "" {
-		fmt.Fprintf(&message, " while processing %s", e.TokenName)
-	}
-	for i, expected := range e.Expected {
-		switch {
-		case i == 0:
-			message.WriteString(", expected ")
-		case i == len(e.Expected)-1:
-			message.WriteString(" or ")
-		default:
-			message.WriteString(", ")
-		}
-		message.WriteString(expected)
-	}
-	return message.String()
-}
-
-func (e *TokenError) Unwrap() error {
-	return e.Err
-}
-
-// tokenError returns err as a TokenError describing the token being processed by the running states
-// (if any) and the runes they expected
-func (machine *StateMachine) tokenError(running states, r rune, err error) error {
-	tokenError := &TokenError{Err: err, Rune: r}
-	for _, state := range running {
-		if tokenError.TokenName == "" && state.token.Id != 0 {
-			tokenError.TokenName = state.token.Name
-		}
-		for _, nextState := range state.nextStates {
-			expected := fmt.Sprintf("%q", nextState.description)
-			if nextState == machine.end {
-				expected = "end of input"
-			}
-			if !slices.Contains(tokenError.Expected, expected) {
-				tokenError.Expected = append(tokenError.Expected, expected)
-			}
-		}
-	}
-	return tokenError
-}
-
 func Match(matcher Matcher, description string) Compiler {
 	return func(machine *StateMachine, token *Token, prevTail states) states {
 		state := &state{
@@ -402,4 +344,66 @@ func copyToken(token *Token) *Token {
 		Value:   token.Value,
 		Error:   token.Error,
 	}
+}
+
+// --------------
+// ERROR HANDLING
+// --------------
+
+// TokenError is an error that occurred while running the state machine.  It wraps Err, which is
+// ErrGrammarMismatch or ErrUnexpectedEOI, so errors.Is(err, Err) is true.
+type TokenError struct {
+	Err       error    // ErrGrammarMismatch or ErrUnexpectedEOI
+	Rune      rune     // the rune that did not match (-1 at the end of input)
+	TokenName string   // name of the token being processed, or "" if no token was being processed
+	Expected  []string // descriptions of the runes that would have matched
+}
+
+func (e *TokenError) Error() string {
+	var message strings.Builder
+	if errors.Is(e.Err, ErrUnexpectedEOI) {
+		message.WriteString("unexpected end of input")
+	} else {
+		fmt.Fprintf(&message, "unexpected rune %q", e.Rune)
+	}
+	if e.TokenName != "" {
+		fmt.Fprintf(&message, " while processing %s", e.TokenName)
+	}
+	for i, expected := range e.Expected {
+		switch {
+		case i == 0:
+			message.WriteString(", expected ")
+		case i == len(e.Expected)-1:
+			message.WriteString(" or ")
+		default:
+			message.WriteString(", ")
+		}
+		message.WriteString(expected)
+	}
+	return message.String()
+}
+
+func (e *TokenError) Unwrap() error {
+	return e.Err
+}
+
+// tokenError returns err as a TokenError describing the token being processed by the running states
+// (if any) and the runes they expected
+func (machine *StateMachine) tokenError(running states, r rune, err error) error {
+	tokenError := &TokenError{Err: err, Rune: r}
+	for _, state := range running {
+		if tokenError.TokenName == "" && state.token.Id != 0 {
+			tokenError.TokenName = state.token.Name
+		}
+		for _, nextState := range state.nextStates {
+			expected := fmt.Sprintf("%q", nextState.description)
+			if nextState == machine.end {
+				expected = "end of input"
+			}
+			if !slices.Contains(tokenError.Expected, expected) {
+				tokenError.Expected = append(tokenError.Expected, expected)
+			}
+		}
+	}
+	return tokenError
 }
