@@ -3,6 +3,7 @@ package tokeniser
 import (
 	"errors"
 	"io"
+	"iter"
 	"slices"
 	"strings"
 )
@@ -240,84 +241,72 @@ func (tr *tokenReader) readRune() (r rune, err error) {
 	return r, err
 }
 
-// Run tokenises input using the grammar compiled into the StateMachine.  Run is not thread-safe but
-// is safe for reuse otherwise.
-// If the input cannot be tokenised, the tokens matched so far are returned followed by an error token
-// whose Error field holds the error and whose position is where the error occurred.
-func (machine *StateMachine) Run(input io.RuneReader) (tokens Tokens) {
-	machine.reset()
-	machine.stale = true
-	running := make(states, 0, 8) // states that are being matched against the current rune
-	pending := make(states, 0, 8) // states that will be matched against the next rune
-	buffer := make([]rune, 0, 64) // runes read since bufferPos, used to build token values
-	bufferPos := 0                // position in the input of buffer[0]
-	tokens = make(Tokens, 0, 8)
-	running = append(running, machine.start) // set start state
+// Run returns a sequence that tokenises input using the grammar compiled into the StateMachine.
+// If the input cannot be tokenised, an error token containing the error and its position is returned
+func (machine *StateMachine) Run(input io.RuneReader) iter.Seq[*Token] {
+	return func(yield func(*Token) bool) {
+		machine.reset()
+		machine.stale = true
+		running := make(states, 0, 8)            // states that are being matched against the current rune
+		pending := make(states, 0, 8)            // states that will be matched against the next rune
+		buffer := make([]rune, 0, 64)            // runes read last token output
+		running = append(running, machine.start) // set start state
 
-	reader := wrapRuneReader(input)
-	// errorToken appends a token reporting err at the position of the rune most recently read
-	errorToken := func(err error) Tokens {
-		token := &Token{Error: err}
-		startToken(reader, token)
-		return append(tokens, token)
-	}
-	r, readErr := reader.readRune()
-	for {
-		if readErr != nil {
-			return errorToken(readErr)
-		}
-		buffer = append(buffer, r)
-		for _, state := range running {
-			for _, nextState := range state.nextStates {
-				if nextState.pos != reader.pos && nextState.match(r) {
-					nextState.pos = reader.pos
-					// if token changes between state, or we are transitioning on an extrinsic transition,
-					// then we have finished a token and are starting a new one.
-					if state.token != nextState.token || !nextState.internal {
-						// add previous token to tokens if not the "default" token
-						if state.token.Id != 0 {
-							from, to := state.token.Pos-bufferPos, reader.pos-bufferPos
-							state.token.Value = string(buffer[from:to])
-							tokens = append(tokens, CopyToken(state.token))
-							// no running state can refer to input before pos so discard it
-							buffer = buffer[to:]
-							bufferPos = reader.pos
-							// if we have just processed the final state then return the tokens.
-							if nextState == machine.end {
-								return tokens
+		reader := wrapRuneReader(input)
+		r, readErr := reader.readRune()
+		for {
+			if readErr != nil {
+				yield(errorToken(reader, readErr))
+				return
+			}
+			for _, state := range running {
+				tokenReturned := false
+				for _, nextState := range state.nextStates {
+					if nextState.pos != reader.pos && nextState.match(r) {
+						nextState.pos = reader.pos
+						// if token changes between state, or we are transitioning on an extrinsic transition,
+						// then we have finished a token and are starting a new one.
+						if state.token != nextState.token || !nextState.internal {
+							// add previous token to tokens if not the "default" token
+							if state.token.Id != 0 {
+								state.token.Value = string(buffer) // exclude r, which starts the next token
+								if !yield(copyToken(state.token)) {
+									return
+								}
+								pending = pending[:0] // clear pending state
 							}
+							// start next token
+							buffer = buffer[:0]
 							startToken(reader, nextState.token)
-							// make nextState the only pending state to enforce token precedence
-							// don't bother processing further states
-							pending = append(pending[:0], nextState)
-							goto processPending
 						}
-						// single character loops have state == nextState, so we cannot update nextState.token.pos
-						// until end of token processing is complete
-						startToken(reader, nextState.token)
+						// if nextState == end then we must also be at the end of the input (r == -1)
+						// so we are all done.
+						if nextState == machine.end {
+							return
+						}
+						pending = append(pending, nextState)
 					}
-					// if nextState == end then we must also be at the end of the input (r == -1)
-					// so we are all done.
-					if nextState == machine.end {
-						return tokens
+					if tokenReturned {
+						break
 					}
-					pending = append(pending, nextState)
 				}
 			}
+			buffer = append(buffer, r)
+			// if r == -1 then we are at the end of the file but not the end of the grammar
+			if r == -1 {
+				yield(errorToken(reader, ErrUnexpectedEOI))
+				return
+			}
+			// no valid pending states ... so exit with error
+			if len(pending) == 0 {
+				yield(errorToken(reader, ErrGrammarMismatch))
+				return
+			}
+			// swap running and pending states and clear the pending state for next iteration
+			running, pending = pending, running
+			pending = pending[:0]
+			r, readErr = reader.readRune()
 		}
-		// if r == -1 then we are at the end of the file but not the end of the grammar
-		if r == -1 {
-			return errorToken(ErrUnexpectedEOI)
-		}
-		// no valid pending states ... so exit with error
-		if len(pending) == 0 {
-			return errorToken(ErrGrammarMismatch)
-		}
-		// swap running and pending states and clear the pending state for next iteration
-	processPending:
-		running, pending = pending, running
-		pending = pending[:0]
-		r, readErr = reader.readRune()
 	}
 }
 
@@ -340,7 +329,14 @@ func startToken(tr *tokenReader, token *Token) {
 	token.Pos, token.Line, token.LinePos = tr.pos, tr.line, tr.linePos
 }
 
-func CopyToken(token *Token) *Token {
+// errorToken creates a token reporting err at the position of the rune most recently read
+func errorToken(tr *tokenReader, err error) *Token {
+	token := &Token{Error: err}
+	startToken(tr, token)
+	return token
+}
+
+func copyToken(token *Token) *Token {
 	return &Token{
 		Id:      token.Id,
 		Name:    token.Name,

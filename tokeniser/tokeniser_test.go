@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -367,7 +368,7 @@ func Test_ErrorTokens(t *testing.T) {
 		{"", nil, errTok{ErrUnexpectedEOI, 0, 1, 1}},
 	}
 	for _, in := range inputs {
-		tokens := Compile(calc()).Run(strings.NewReader(in.input))
+		tokens := slices.Collect(Compile(calc()).Run(strings.NewReader(in.input)))
 		if len(tokens) == 0 || tokens[len(tokens)-1].Error == nil {
 			t.Errorf("%q: expected an error token last, got %v", in.input, newToks(tokens))
 			continue
@@ -391,7 +392,7 @@ func Test_ErrorTokens(t *testing.T) {
 
 	// errors from the reader are reported as error tokens at the position of the failed read
 	readErr := errors.New("read failed")
-	tokens := Compile(calc()).Run(&failingReader{strings.NewReader("12"), readErr})
+	tokens := slices.Collect(Compile(calc()).Run(&failingReader{strings.NewReader("12"), readErr}))
 	if len(tokens) != 1 || !errors.Is(tokens[0].Error, readErr) || tokens[0].Pos != 2 {
 		t.Errorf("expected a single error token %q at position 2, got %+v", readErr, tokens)
 	}
@@ -464,6 +465,31 @@ func Test_TokenLines(t *testing.T) {
 	}
 }
 
+// tokens are produced as the sequence is iterated, and iteration can stop early
+func Test_RunIter(t *testing.T) {
+	machine := Compile(lexer())
+	input := strings.NewReader("ab 12 cd")
+	var got []tok
+	for token := range machine.Run(input) {
+		got = append(got, newTok(token))
+		if len(got) == 2 {
+			break
+		}
+	}
+	if want := []tok{{"ident", 0, "ab"}, {"number", 3, "12"}}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("expected tokens %v before break, got %v", want, got)
+	}
+	// input is only read as far as needed: "12" completes when the following space is read
+	if rest, _ := io.ReadAll(input); string(rest) != "cd" {
+		t.Errorf("expected unread input %q, got %q", "cd", rest)
+	}
+	// the machine can be run again after an iteration stops early
+	tokens, err := splitError(slices.Collect(machine.Run(strings.NewReader("x+3"))))
+	if want := []tok{{"ident", 0, "x"}, {"add", 1, "+"}, {"number", 2, "3"}}; err != nil || fmt.Sprint(newToks(tokens)) != fmt.Sprint(want) {
+		t.Errorf("expected tokens %v and no error, got %v and %v", want, newToks(tokens), err)
+	}
+}
+
 // a compiled StateMachine can be run many times, including after a failed run
 func Test_Reuse(t *testing.T) {
 	machine := Compile(lexer())
@@ -478,7 +504,7 @@ func Test_Reuse(t *testing.T) {
 		{"ab 12", nil, []tok{{"ident", 0, "ab"}, {"number", 3, "12"}}},
 	}
 	for _, in := range inputs {
-		tokens, err := splitError(machine.Run(strings.NewReader(in.input)))
+		tokens, err := splitError(slices.Collect(machine.Run(strings.NewReader(in.input))))
 		if !errors.Is(err, in.err) {
 			t.Errorf("%q: expected error %v, got %v", in.input, in.err, err)
 			continue
@@ -529,7 +555,7 @@ func run(t *testing.T, input string, exp Compiler) (tokens Tokens, err error) {
 			tokens, err = nil, fmt.Errorf("panic: %v", r)
 		}
 	}()
-	return splitError(Compile(exp).Run(strings.NewReader(input)))
+	return splitError(slices.Collect(Compile(exp).Run(strings.NewReader(input))))
 }
 
 // splitError removes a trailing error token, returning the error it reports
