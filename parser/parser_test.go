@@ -417,7 +417,7 @@ func Test_RuleLeftRecursion(t *testing.T) {
 	}
 }
 
-// Leading calls into a non-recursive rule are not left recursion.
+// Calling a non-recursive rule before reading a rune is not left recursion.
 func Test_RuleLeadingCallAllowed(t *testing.T) {
 	match(t, "ab", Rule("x", Rule("y", Char('a')), Char('b')), "x(y(a) b)")
 	match(t, "ab", Rule("x", Rule("y", Rule("z", Char('a'))), Char('b')), "x(y(z(a)) b)")
@@ -647,7 +647,8 @@ func Test_ChoiceLazyRecursive(t *testing.T) {
 	match(t, "a,a.", list, "list(a (, list(a .)))")
 }
 
-// A leading call in any alternative counts, not just the first.
+// A call reached without reading a rune counts in any alternative, not just
+// the first.
 func Test_ChoiceLeftRecursion(t *testing.T) {
 	var e1, e2, e3, a Compiler
 	e1 = Rule("e", Choice(Seq(Lazy(&e1), Char('+')), Char('1')))
@@ -659,7 +660,7 @@ func Test_ChoiceLeftRecursion(t *testing.T) {
 	}
 }
 
-// Leading calls into rules that consume first are fine through Choice too.
+// Calling rules that read a rune first is fine through Choice too.
 func Test_ChoiceLeadingCallAllowed(t *testing.T) {
 	x, y := Rule("x", Char('a')), Rule("y", Char('b'))
 	match(t, "b", Rule("e", Choice(x, y)), "e(y(b))")
@@ -1034,8 +1035,9 @@ func Test_OneOrMoreDedup(t *testing.T) {
 	}
 }
 
-// The body always runs once, so a leading call inside it is a leading call of
-// the enclosing rule; nullability of the body carries through.
+// The body always runs once, so a call it reaches without reading a rune is
+// reached without reading a rune by the enclosing rule too; nullability of the
+// body carries through.
 func Test_OneOrMoreLeftRecursion(t *testing.T) {
 	var r1, r2, r3 Compiler
 	r1 = Rule("r", OneOrMore(Lazy(&r1)), Char('a'))

@@ -449,9 +449,9 @@ func (p *program) compileBodies() {
 	}
 }
 
-// A rule is left recursive when it can reach a call to itself without
-// consuming input, directly or through other rules. Calls to nullable rules
-// are stepped over, since execution continues past them without consuming.
+// A rule is left recursive when it can reach a call to itself without reading
+// a rune, directly or through other rules. Calls to nullable rules are stepped
+// over, since execution continues past them without reading a rune.
 func (p *program) checkLeftRecursion() error {
 	nullable := p.nullableRules()
 	state := make([]visit, len(p.rules))
@@ -463,7 +463,7 @@ func (p *program) checkLeftRecursion() error {
 	return nil
 }
 
-// Rules that can complete without consuming input. Iterated to a fixpoint
+// Rules whose end is reachable without reading a rune. Iterated to a fixpoint
 // because a rule's nullability depends on the rules it calls.
 func (p *program) nullableRules() []bool {
 	nullable := make([]bool, len(p.rules))
@@ -473,7 +473,7 @@ func (p *program) nullableRules() []bool {
 			if nullable[i] {
 				continue
 			}
-			if _, ret := p.leading(r.entry, nullable); ret {
+			if _, reachesEnd := p.reachWithoutReadingRune(r.entry, nullable); reachesEnd {
 				nullable[i] = true
 				changed = true
 			}
@@ -490,8 +490,8 @@ const (
 	visited
 )
 
-// Depth-first search over leading calls; reaching a rule still being visited
-// closes a cycle.
+// Depth-first search over the calls each rule reaches without reading a rune;
+// reaching a rule still being visited closes a cycle.
 func (p *program) leftCycle(id int32, state []visit, nullable []bool) (int32, bool) {
 	switch state[id] {
 	case visiting:
@@ -500,7 +500,7 @@ func (p *program) leftCycle(id int32, state []visit, nullable []bool) (int32, bo
 		return 0, false
 	}
 	state[id] = visiting
-	calls, _ := p.leading(p.rules[id].entry, nullable)
+	calls, _ := p.reachWithoutReadingRune(p.rules[id].entry, nullable)
 	for _, callee := range calls {
 		if c, ok := p.leftCycle(callee, state, nullable); ok {
 			return c, true
@@ -510,10 +510,10 @@ func (p *program) leftCycle(id int32, state []visit, nullable []bool) (int32, bo
 	return 0, false
 }
 
-// Walks every path from pc that consumes no input, returning the rules called
-// along them and whether the end of the rule body is reachable. Visited pcs
-// are tracked because Many emits a backward jump.
-func (p *program) leading(pc int32, nullable []bool) (calls []int32, ret bool) {
+// Walks every path from pc that reaches no rune-reading op, returning the
+// rules called along them and whether the end of the rule body is reached.
+// Visited pcs are tracked because Many emits a backward jump.
+func (p *program) reachWithoutReadingRune(pc int32, nullable []bool) (calls []int32, reachesEnd bool) {
 	seen := make(map[int32]bool)
 	work := []int32{pc}
 	for len(work) > 0 {
@@ -526,7 +526,7 @@ func (p *program) leading(pc int32, nullable []bool) (calls []int32, ret bool) {
 		switch c := p.code[pc]; c {
 		case opChar, opRange, opEof:
 		case opRet:
-			ret = true
+			reachesEnd = true
 		case opCall:
 			id := p.code[pc+1]
 			calls = append(calls, id)
@@ -541,7 +541,7 @@ func (p *program) leading(pc int32, nullable []bool) (calls []int32, ret bool) {
 			work = append(work, pc+widths[c])
 		}
 	}
-	return calls, ret
+	return calls, reachesEnd
 }
 
 // A thread's future depends only on its pc and return stack; its node stack
