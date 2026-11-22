@@ -813,6 +813,7 @@ func Test_ChoicePanics(t *testing.T) {
 // User-defined kinds for Token tests.
 const (
 	nkWord int32 = iota
+	nkInteger
 	nkNumber
 )
 
@@ -891,11 +892,14 @@ func Test_TokenEmpty(t *testing.T) {
 // digits after the point, so "1." is rejected.
 func Test_FloatingPoint(t *testing.T) {
 	digit := Range('0', '9')
-	integer := OneOrMore(digit)
+	digits := OneOrMore(digit)
 	sign := Choice('+', '-')
-	mantissa := Seq('.', integer)
-	exponent := Seq(Choice('e', 'E'), Optional(sign), integer)
-	float := Token(nkNumber, Optional(sign), integer, Optional(mantissa), Optional(exponent))
+	mantissa := Seq('.', digits)
+	exponent := Seq(Choice('e', 'E'), Optional(sign), digits)
+	float := Token(nkNumber, Optional(sign), digits, Optional(mantissa), Optional(exponent))
+	integer := Token(nkInteger, Optional(sign), digits)
+
+	number := Choice(integer, float)
 
 	match(t, "0", float, "0")
 	match(t, "42", float, "42")
@@ -916,6 +920,36 @@ func Test_FloatingPoint(t *testing.T) {
 	noMatch(t, "--1", float, ErrGrammarMismatch)
 	noMatch(t, "1.2.3", float, ErrGrammarMismatch)
 	noMatch(t, "1x", float, ErrGrammarMismatch)
+
+	// Choice prefers integer for whole numbers, signed or not; anything with a
+	// fraction or exponent falls through to float.
+	numbers := []struct {
+		input string
+		kind  int32
+	}{
+		{"0", nkInteger},
+		{"42", nkInteger},
+		{"-7", nkInteger},
+		{"+7", nkInteger},
+		{"3.14", nkNumber},
+		{"1e10", nkNumber},
+		{"+6.02E+23", nkNumber},
+	}
+	for _, tc := range numbers {
+		n, err := run(t, tc.input, number)
+		if err != nil {
+			t.Errorf("%q: unexpected error: %v", tc.input, err)
+			continue
+		}
+		if n.Kind != tc.kind || n.Lexeme != tc.input {
+			t.Errorf("%q: number = %d %q, want %d %q", tc.input, n.Kind, n.Lexeme, tc.kind, tc.input)
+		}
+	}
+
+	noMatch(t, "", number, ErrUnexpectedEOI)
+	noMatch(t, "1.", number, ErrUnexpectedEOI)
+	noMatch(t, ".5", number, ErrGrammarMismatch)
+	noMatch(t, "1x", number, ErrGrammarMismatch)
 }
 
 // Top-level Optional and ZeroOrMore can leave several nodes at end of input;
