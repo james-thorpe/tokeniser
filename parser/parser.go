@@ -171,6 +171,18 @@ func ZeroOrMore(first any, rest ...any) Compiler {
 	}
 }
 
+// OneOrMore is ZeroOrMore without the entry fork, so the body must match at
+// least once. Matching is greedy.
+func OneOrMore(first any, rest ...any) Compiler {
+	convertedFirst := convertToCompiler(first)
+	convertedRest := convertToCompilers(rest)
+	return func(p *program) {
+		body := int32(len(*p))
+		emit(p, convertedFirst, convertedRest)
+		op(p, opFork, body)
+	}
+}
+
 func emit(p *program, first Compiler, rest []Compiler) {
 	first(p)
 	for _, compiler := range rest {

@@ -593,6 +593,100 @@ func Test_ZeroOrMorePanics(t *testing.T) {
 	}
 }
 
+// The body comes first; the backward fork after it targets the body start.
+func Test_OneOrMoreCompile(t *testing.T) {
+	compiles(t, OneOrMore('a'),
+		opChar, 'a', 'a',
+		opFork, 0)
+	compiles(t, Seq('x', OneOrMore('a', 'b')),
+		opMark,
+		opChar, 'x', 'x',
+		opChar, 'a', 'a',
+		opChar, 'b', 'b',
+		opFork, 4,
+		opSeq)
+}
+
+func Test_OneOrMore(t *testing.T) {
+	match(t, "a", OneOrMore('a'), "a")
+	match(t, "aaa", OneOrMore('a'), "aaa")
+	match(t, "123", OneOrMore(Range('0', '9')), "123")
+	match(t, "a", Seq(OneOrMore(Seq('a'))), "((a))")
+	match(t, "aa", Seq(OneOrMore(Seq('a'))), "((a) (a))")
+
+	noMatch(t, "", OneOrMore('a'), ErrUnexpectedEOI)
+	noMatch(t, "b", OneOrMore('a'), ErrGrammarMismatch)
+	noMatch(t, "aab", OneOrMore('a'), ErrGrammarMismatch)
+}
+
+func Test_OneOrMoreInSeq(t *testing.T) {
+	c := Seq('x', OneOrMore(Seq('a')), 'y')
+	match(t, "xay", c, "(x (a) y)")
+	match(t, "xaay", c, "(x (a) (a) y)")
+
+	noMatch(t, "xy", c, ErrGrammarMismatch)
+	noMatch(t, "xaa", c, ErrUnexpectedEOI)
+}
+
+// Multiple elements repeat as a group.
+func Test_OneOrMoreMulti(t *testing.T) {
+	c := Seq(OneOrMore('a', Seq('b')))
+	match(t, "ab", c, "(a (b))")
+	match(t, "abab", c, "(a (b) a (b))")
+
+	noMatch(t, "", c, ErrUnexpectedEOI)
+	noMatch(t, "aba", c, ErrUnexpectedEOI)
+}
+
+func Test_OneOrMoreGreedy(t *testing.T) {
+	c := Seq(OneOrMore(Seq('a')), Optional('a'))
+	match(t, "a", c, "((a))")
+	match(t, "aa", c, "((a) (a))")
+}
+
+// A body that can match empty input must not loop forever.
+func Test_OneOrMoreNullable(t *testing.T) {
+	match(t, "", Seq(OneOrMore(Optional('a'))), "()")
+	match(t, "aa", Seq(OneOrMore(Optional('a'))), "(aa)")
+	match(t, "aa", Seq(OneOrMore(ZeroOrMore(Seq('a')))), "((a) (a))")
+}
+
+// Several iterations at top level are wrapped by opEof; one is returned as is.
+func Test_OneOrMoreTopLevel(t *testing.T) {
+	match(t, "a", OneOrMore(Seq('a')), "(a)")
+	match(t, "aa", OneOrMore(Seq('a')), "((a) (a))")
+}
+
+func Test_OneOrMorePanics(t *testing.T) {
+	cases := []struct {
+		name  string
+		first any
+		rest  []any
+		want  error
+	}{
+		{"empty text", "", nil, ErrEmptyText},
+		{"empty text rest", 'a', []any{""}, ErrEmptyText},
+		{"unsupported", 1, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("no panic")
+				}
+				if tc.want == nil {
+					return
+				}
+				if err, ok := r.(error); !ok || !errors.Is(err, tc.want) {
+					t.Errorf("recovered %v, want %v", r, tc.want)
+				}
+			}()
+			OneOrMore(tc.first, tc.rest...)
+		})
+	}
+}
+
 // Top-level Optional and ZeroOrMore can leave several nodes at end of input;
 // opEof wraps them in a seq node rather than returning only the last.
 func Test_EofMultipleNodes(t *testing.T) {

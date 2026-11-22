@@ -20,10 +20,11 @@ parenthesised, space-separated list of children.
 | `Seq`                    | Exactly one seq node holding its elements' nodes.            |
 | `Optional`               | Its elements' nodes when matched, nothing when skipped.      |
 | `ZeroOrMore`             | Its elements' nodes once per iteration, nothing for zero.    |
+| `OneOrMore`              | Its elements' nodes once per iteration; at least one.        |
 
-`Optional` and `ZeroOrMore` never add a node of their own. Their elements'
-nodes become children of the enclosing `Seq`; wrap the elements in a `Seq` to
-keep them grouped.
+`Optional`, `ZeroOrMore` and `OneOrMore` never add a node of their own. Their
+elements' nodes become children of the enclosing `Seq`; wrap the elements in a
+`Seq` to keep them grouped.
 
 | Grammar                                  | Input  | Tree            |
 |------------------------------------------|--------|-----------------|
@@ -57,7 +58,8 @@ left on the stack:
 | one        | that node, unwrapped                               |
 | several    | a new seq node holding them in match order         |
 
-Only a top-level `Optional` or `ZeroOrMore` can leave zero or several nodes.
+Only a top-level `Optional` or `ZeroOrMore` can leave no nodes, and only
+those and `OneOrMore` can leave several.
 
 | Grammar                   | Input  | Root        |
 |---------------------------|--------|-------------|
@@ -67,15 +69,17 @@ Only a top-level `Optional` or `ZeroOrMore` can leave zero or several nodes.
 | `ZeroOrMore(Seq('a'))`    | `aa`   | `((a) (a))` |
 | `Optional('a', Seq('b'))` | `ab`   | `(a (b))`   |
 
-The shape of the root under a top-level `Optional` or `ZeroOrMore` therefore
-depends on the input: one iteration of `ZeroOrMore(Seq('a'))` returns the
-inner seq node directly, while two return a new seq node wrapping both. Wrap
-the grammar in `Seq` for a root whose shape does not vary.
+The shape of the root under a top-level `Optional`, `ZeroOrMore` or
+`OneOrMore` therefore depends on the input: one iteration of
+`ZeroOrMore(Seq('a'))` returns the inner seq node directly, while two return a
+new seq node wrapping both. Wrap the grammar in `Seq` for a root whose shape
+does not vary.
 
 ## Matching
 
-`Optional` and `ZeroOrMore` are greedy: when several parses of the input
-succeed, the one that matches elements earlier and more often is returned.
+`Optional`, `ZeroOrMore` and `OneOrMore` are greedy: when several parses of
+the input succeed, the one that matches elements earlier and more often is
+returned.
 
 | Grammar                                  | Input | Tree        |
 |------------------------------------------|-------|-------------|
