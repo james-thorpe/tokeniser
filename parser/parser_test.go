@@ -16,32 +16,32 @@ func Test_RangeCompile(t *testing.T) {
 	compiles(t, Range('a', 'z'), opChar, 'a', 'z')
 }
 
-// Each element after the first is followed by an opCat joining it to
-// everything before, so a sequence of n elements emits n-1 cats.
+// A sequence brackets its elements with opMark and opSeq.
 func Test_SeqCompile(t *testing.T) {
-	compiles(t, Seq(Char('a')), opChar, 'a', 'a')
+	compiles(t, Seq(Char('a')), opMark, opChar, 'a', 'a', opSeq)
 	compiles(t, Seq(Char('a'), Range('0', '9'), Char('b')),
+		opMark,
 		opChar, 'a', 'a',
 		opChar, '0', '9',
-		opCat,
 		opChar, 'b', 'b',
-		opCat)
+		opSeq)
 	compiles(t, Seq(Seq(Char('a'), Char('b')), Char('c')),
+		opMark,
+		opMark,
 		opChar, 'a', 'a',
 		opChar, 'b', 'b',
-		opCat,
+		opSeq,
 		opChar, 'c', 'c',
-		opCat)
+		opSeq)
 }
 
+// Text emits only chars; they merge into a single node at run time.
 func Test_TextCompile(t *testing.T) {
 	compiles(t, Text("a"), opChar, 'a', 'a')
 	compiles(t, Text("abc"),
 		opChar, 'a', 'a',
 		opChar, 'b', 'b',
-		opCat,
-		opChar, 'c', 'c',
-		opCat)
+		opChar, 'c', 'c')
 }
 
 // Text splits on runes; splitting on bytes would emit partial code points.
@@ -50,9 +50,7 @@ func Test_TextCompileMultibyte(t *testing.T) {
 	compiles(t, Text("a😀b"),
 		opChar, 'a', 'a',
 		opChar, '😀', '😀',
-		opCat,
-		opChar, 'b', 'b',
-		opCat)
+		opChar, 'b', 'b')
 }
 
 // Invalid UTF-8 decodes to U+FFFD on both the grammar and input side, so the
@@ -62,15 +60,13 @@ func Test_TextInvalidUTF8(t *testing.T) {
 	compiles(t, Text("a\xffb"),
 		opChar, 'a', 'a',
 		opChar, '�', '�',
-		opCat,
-		opChar, 'b', 'b',
-		opCat)
+		opChar, 'b', 'b')
 }
 
 func Test_Text(t *testing.T) {
 	match(t, "a", Text("a"), "a")
-	match(t, "abc", Text("abc"), "((a b) c)")
-	match(t, "a-b", Text("a-b"), "((a -) b)")
+	match(t, "abc", Text("abc"), "abc")
+	match(t, "a b", Text("a b"), "a b")
 
 	noMatch(t, "", Text("a"), ErrUnexpectedEOI)
 	noMatch(t, "ab", Text("abc"), ErrUnexpectedEOI)
@@ -82,27 +78,27 @@ func Test_Text(t *testing.T) {
 
 func Test_TextMultibyte(t *testing.T) {
 	match(t, "é", Text("é"), "é")
-	match(t, "a😀b", Text("a😀b"), "((a 😀) b)")
-	match(t, "é!", Seq(Text("é"), Char('!')), "(é !)")
+	match(t, "a😀b", Text("a😀b"), "a😀b")
+	match(t, "é!", Seq(Text("é"), Char('!')), "(é!)")
 
 	noMatch(t, "e", Text("é"), ErrGrammarMismatch)
 }
 
-// opCat consumes no input, so execution must continue to the following
-// operation within the same step.
+// opMark and opSeq consume no input, so execution must continue to the
+// following operation within the same step.
 func Test_TextInSeq(t *testing.T) {
-	match(t, "abc", Seq(Text("ab"), Char('c')), "((a b) c)")
-	match(t, "abc", Seq(Char('a'), Text("bc")), "(a (b c))")
-	match(t, "abcd", Seq(Text("ab"), Text("cd")), "((a b) (c d))")
-	match(t, "a1", Seq(Text("a"), Range('0', '9')), "(a 1)")
+	match(t, "abc", Seq(Text("ab"), Char('c')), "(abc)")
+	match(t, "abc", Seq(Char('a'), Text("bc")), "(abc)")
+	match(t, "abcd", Seq(Text("ab"), Text("cd")), "(abcd)")
+	match(t, "a1", Seq(Text("a"), Range('0', '9')), "(a1)")
 
 	noMatch(t, "abx", Seq(Text("ab"), Char('c')), ErrGrammarMismatch)
 	noMatch(t, "ab", Seq(Text("ab"), Char('c')), ErrUnexpectedEOI)
 }
 
 func Test_TextNested(t *testing.T) {
-	match(t, "abc", Seq(Seq(Text("ab")), Text("c")), "((a b) c)")
-	match(t, "abcd", Seq(Char('a'), Seq(Text("bc"), Char('d'))), "(a ((b c) d))")
+	match(t, "abc", Seq(Seq(Text("ab")), Text("c")), "((ab) c)")
+	match(t, "abcd", Seq(Char('a'), Seq(Text("bc"), Char('d'))), "(a (bcd))")
 
 	noMatch(t, "abx", Seq(Seq(Text("ab")), Text("c")), ErrGrammarMismatch)
 }
@@ -110,11 +106,7 @@ func Test_TextNested(t *testing.T) {
 // Exceeds the initial program capacity (64) in Run.
 func Test_TextLong(t *testing.T) {
 	s := strings.Repeat("abcdefghij", 10)
-	want := s[:1]
-	for _, r := range s[1:] {
-		want = "(" + want + " " + string(r) + ")"
-	}
-	match(t, s, Text(s), want)
+	match(t, s, Text(s), s)
 	noMatch(t, s[:len(s)-1], Text(s), ErrUnexpectedEOI)
 	noMatch(t, s[:50]+"x"+s[51:], Text(s), ErrGrammarMismatch)
 }
@@ -130,6 +122,15 @@ func Test_TextEmptyPanics(t *testing.T) {
 	Text("")
 }
 
+// Adjacent chars merge into one node whatever produced them; only a nested
+// sequence's mark separates them.
+func Test_CharsMerge(t *testing.T) {
+	match(t, "a5b", Seq('a', Range('0', '9'), 'b'), "(a5b)")
+	match(t, "abc", Seq('a', Seq('b'), 'c'), "(a (b) c)")
+	match(t, "abcde", Seq("ab", Optional("cd"), 'e'), "(abcde)")
+	match(t, "abe", Seq("ab", Optional("cd"), 'e'), "(abe)")
+}
+
 func Test_NodeKinds(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -137,12 +138,14 @@ func Test_NodeKinds(t *testing.T) {
 		c     Compiler
 		want  string
 	}{
-		{"char", "a", Char('a'), nkChar},
-		{"range", "a", Range('a', 'z'), nkChar},
-		{"seq single", "a", Seq(Char('a')), nkChar},
+		{"char", "a", Char('a'), nkChars},
+		{"range", "a", Range('a', 'z'), nkChars},
+		{"seq single", "a", Seq(Char('a')), nkSeq},
 		{"seq", "ab", Seq(Char('a'), Char('b')), nkSeq},
-		{"text single", "a", Text("a"), nkChar},
-		{"text", "ab", Text("ab"), nkSeq},
+		{"text single", "a", Text("a"), nkChars},
+		{"text", "ab", Text("ab"), nkChars},
+		{"optional present", "a", Optional('a'), nkChars},
+		{"seq of skipped optional", "", Seq(Optional('a')), nkSeq},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -185,11 +188,11 @@ func Test_Range(t *testing.T) {
 	noMatch(t, "a", Range('z', 'a'), ErrGrammarMismatch)
 }
 
-// A single-element Seq emits no opCat, so it is transparent in the tree.
+// A single-element Seq still wraps its element in a sequence node.
 func Test_Seq(t *testing.T) {
-	match(t, "a", Seq(Char('a')), "a")
-	match(t, "abc", Seq(Char('a'), Char('b'), Char('c')), "((a b) c)")
-	match(t, "a5", Seq(Char('a'), Range('0', '9')), "(a 5)")
+	match(t, "a", Seq(Char('a')), "(a)")
+	match(t, "abc", Seq(Char('a'), Char('b'), Char('c')), "(abc)")
+	match(t, "a5", Seq(Char('a'), Range('0', '9')), "(a5)")
 
 	noMatch(t, "", Seq(Char('a')), ErrUnexpectedEOI)
 	noMatch(t, "ab", Seq(Char('a'), Char('b'), Char('c')), ErrUnexpectedEOI)
@@ -200,10 +203,10 @@ func Test_Seq(t *testing.T) {
 }
 
 func Test_SeqNested(t *testing.T) {
-	match(t, "abc", Seq(Seq(Char('a'), Char('b')), Char('c')), "((a b) c)")
-	match(t, "abc", Seq(Char('a'), Seq(Char('b'), Char('c'))), "(a (b c))")
-	match(t, "abcd", Seq(Seq(Char('a'), Char('b')), Seq(Char('c'), Char('d'))), "((a b) (c d))")
-	match(t, "a", Seq(Seq(Seq(Char('a')))), "a")
+	match(t, "abc", Seq(Seq(Char('a'), Char('b')), Char('c')), "((ab) c)")
+	match(t, "abc", Seq(Char('a'), Seq(Char('b'), Char('c'))), "(a (bc))")
+	match(t, "abcd", Seq(Seq(Char('a'), Char('b')), Seq(Char('c'), Char('d'))), "((ab) (cd))")
+	match(t, "a", Seq(Seq(Seq(Char('a')))), "(((a)))")
 
 	noMatch(t, "ab", Seq(Seq(Char('a'), Char('b')), Char('c')), ErrUnexpectedEOI)
 	noMatch(t, "abx", Seq(Char('a'), Seq(Char('b'), Char('c'))), ErrGrammarMismatch)
@@ -212,30 +215,30 @@ func Test_SeqNested(t *testing.T) {
 // Seq converts rune and string elements to Char and Text, so both forms
 // compile identically.
 func Test_SeqConvertCompile(t *testing.T) {
-	compiles(t, Seq('a'), opChar, 'a', 'a')
+	compiles(t, Seq('a'), opMark, opChar, 'a', 'a', opSeq)
 	compiles(t, Seq("ab"),
+		opMark,
 		opChar, 'a', 'a',
 		opChar, 'b', 'b',
-		opCat)
+		opSeq)
 	compiles(t, Seq('a', "bc", Range('0', '9')),
+		opMark,
 		opChar, 'a', 'a',
 		opChar, 'b', 'b',
 		opChar, 'c', 'c',
-		opCat,
-		opCat,
 		opChar, '0', '9',
-		opCat)
+		opSeq)
 }
 
 func Test_SeqConvert(t *testing.T) {
-	match(t, "a", Seq('a'), "a")
-	match(t, "é", Seq('é'), "é")
-	match(t, "ab", Seq("ab"), "(a b)")
-	match(t, "abc", Seq('a', 'b', 'c'), "((a b) c)")
-	match(t, "abc", Seq('a', "bc"), "(a (b c))")
-	match(t, "abc", Seq("ab", 'c'), "((a b) c)")
-	match(t, "ab1", Seq("ab", Range('0', '9')), "((a b) 1)")
-	match(t, "abc", Seq('a', Seq('b', "c")), "(a (b c))")
+	match(t, "a", Seq('a'), "(a)")
+	match(t, "é", Seq('é'), "(é)")
+	match(t, "ab", Seq("ab"), "(ab)")
+	match(t, "abc", Seq('a', 'b', 'c'), "(abc)")
+	match(t, "abc", Seq('a', "bc"), "(abc)")
+	match(t, "abc", Seq("ab", 'c'), "(abc)")
+	match(t, "ab1", Seq("ab", Range('0', '9')), "(ab1)")
+	match(t, "abc", Seq('a', Seq('b', "c")), "(a (bc))")
 
 	noMatch(t, "ax", Seq('a', 'b'), ErrGrammarMismatch)
 	noMatch(t, "ab", Seq("ab", 'c'), ErrUnexpectedEOI)
@@ -278,24 +281,182 @@ func Test_SeqConvertUnsupportedPanics(t *testing.T) {
 	}
 }
 
-// Sequence nodes are binary and interior only; leaves carry the lexeme.
+// The fork target is the first op after the optional element.
+func Test_OptionalCompile(t *testing.T) {
+	compiles(t, Optional('a'), opFork, 5, opChar, 'a', 'a')
+	compiles(t, Seq('x', Optional('a')),
+		opMark,
+		opChar, 'x', 'x',
+		opFork, 9,
+		opChar, 'a', 'a',
+		opSeq)
+	compiles(t, Optional("ab"),
+		opFork, 8,
+		opChar, 'a', 'a',
+		opChar, 'b', 'b')
+	compiles(t, Optional(Optional('a')),
+		opFork, 7,
+		opFork, 7,
+		opChar, 'a', 'a')
+}
+
+func Test_Optional(t *testing.T) {
+	match(t, "a", Optional('a'), "a")
+	match(t, "ab", Optional("ab"), "ab")
+	match(t, "5", Optional(Range('0', '9')), "5")
+
+	noMatch(t, "b", Optional('a'), ErrGrammarMismatch)
+	noMatch(t, "aa", Optional('a'), ErrGrammarMismatch)
+	noMatch(t, "a", Optional("ab"), ErrUnexpectedEOI)
+}
+
+// A skipped top-level Optional leaves the stack empty at opEof; Run reports a
+// successful match with no tree rather than dereferencing an empty stack.
+func Test_OptionalEmptyResult(t *testing.T) {
+	cases := []struct {
+		name string
+		c    Compiler
+	}{
+		{"char", Optional('a')},
+		{"text", Optional("ab")},
+		{"nested", Optional(Optional('a'))},
+		{"seq", Optional(Seq('a', Optional('b')))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n, err := run(t, "", tc.c)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if n != nil {
+				t.Errorf("tree = %s, want nil", show(n))
+			}
+		})
+	}
+}
+
+// The skipped branch shares the stack with the matching branch, so both must
+// still see the nodes pushed before the fork. A skipped element contributes no
+// child.
+func Test_OptionalInSeq(t *testing.T) {
+	abc := Seq('a', Optional(Seq('b')), 'c')
+	match(t, "abc", abc, "(a (b) c)")
+	match(t, "ac", abc, "(ac)")
+	match(t, "ab", Seq(Optional(Seq('a')), 'b'), "((a) b)")
+	match(t, "b", Seq(Optional(Seq('a')), 'b'), "(b)")
+	match(t, "a", Seq('a', Optional(Seq('b'))), "(a)")
+	match(t, "ab", Seq('a', Optional(Seq('b'))), "(a (b))")
+	match(t, "", Seq(Optional('a'), Optional('b')), "()")
+	match(t, "b", Seq(Optional('a'), Optional('b')), "(b)")
+
+	noMatch(t, "ab", abc, ErrUnexpectedEOI)
+	noMatch(t, "abd", abc, ErrGrammarMismatch)
+	noMatch(t, "abbc", abc, ErrGrammarMismatch)
+}
+
+// When both branches reach end of input, the branch that matched the earlier
+// optional element wins. Machine order must therefore be preserved across
+// steps. The optionals differ in shape so the winner is visible in the tree.
+func Test_OptionalPriority(t *testing.T) {
+	c := Seq(Optional(Seq('a')), Optional('a'))
+	match(t, "a", c, "((a))")
+	c = Seq(Optional(Seq('a')), Optional('a'), Optional(Seq('a')))
+	match(t, "a", c, "((a))")
+	match(t, "aa", c, "((a) a)")
+}
+
+// The pending tail must be reset each step; a stale tail points at a machine
+// already moved to running, so the next step's matches would be linked onto
+// the running list instead of pending.
+func Test_PendingAcrossSteps(t *testing.T) {
+	match(t, "ab", Text("ab"), "ab")
+	match(t, "abcd", Seq('a', Optional('b'), Optional('c'), 'd'), "(abcd)")
+	match(t, "ad", Seq('a', Optional('b'), Optional('c'), 'd'), "(ad)")
+	noMatch(t, "ab", Text("abc"), ErrUnexpectedEOI)
+}
+
+// The fork must run on the same rune even when the forking machine is the
+// last one queued.
+func Test_OptionalForkLast(t *testing.T) {
+	match(t, "b", Seq(Optional('a'), 'b'), "(b)")
+	match(t, "xb", Seq('x', Optional('a'), 'b'), "(xb)")
+}
+
+// Both branches can succeed; each input length selects exactly one.
+func Test_OptionalAmbiguous(t *testing.T) {
+	c := Seq(Optional(Seq('a')), 'a')
+	match(t, "a", c, "(a)")
+	match(t, "aa", c, "((a) a)")
+	noMatch(t, "aaa", c, ErrGrammarMismatch)
+}
+
+func Test_OptionalNested(t *testing.T) {
+	match(t, "a", Optional(Optional('a')), "a")
+	match(t, "ab", Optional(Seq('a', Optional('b'))), "(ab)")
+	match(t, "a", Optional(Seq('a', Optional('b'))), "(a)")
+	match(t, "abc", Optional(Seq('a', Optional(Seq('b')), Optional('c'))), "(a (b) c)")
+	match(t, "ac", Optional(Seq('a', Optional(Seq('b')), Optional('c'))), "(ac)")
+}
+
+func Test_OptionalErrorOffset(t *testing.T) {
+	_, err := run(t, "axc", Seq('a', Optional('b'), 'c'))
+	want := `grammar mismatch: unexpected 'x' at offset 1`
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v, want %q", err, want)
+	}
+}
+
+func Test_OptionalPanics(t *testing.T) {
+	cases := []struct {
+		name string
+		item any
+		want error
+	}{
+		{"empty text", "", ErrEmptyText},
+		{"unsupported", 1, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("no panic")
+				}
+				if tc.want == nil {
+					return
+				}
+				if err, ok := r.(error); !ok || !errors.Is(err, tc.want) {
+					t.Errorf("recovered %v, want %v", r, tc.want)
+				}
+			}()
+			Optional(tc.item)
+		})
+	}
+}
+
+// Sequence nodes are interior only; leaves are chars nodes carrying the
+// lexeme.
 func Test_SeqNodeShape(t *testing.T) {
-	s, err := run(t, "ab", Seq(Char('a'), Char('b')))
+	s, err := run(t, "abc", Seq('a', Seq('b'), 'c'))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if s == nil {
 		t.Fatal("nil tree")
 	}
-	if s.lexeme != "" {
-		t.Errorf("seq lexeme = %q, want empty", s.lexeme)
+	if s.kind != nkSeq || s.lexeme != "" {
+		t.Errorf("root = %q %q, want seq with empty lexeme", s.kind, s.lexeme)
 	}
-	if len(s.children) != 2 {
-		t.Fatalf("seq children = %d, want 2", len(s.children))
+	wantKinds := []string{nkChars, nkSeq, nkChars}
+	if len(s.children) != len(wantKinds) {
+		t.Fatalf("children = %d, want %d", len(s.children), len(wantKinds))
 	}
 	for i, c := range s.children {
-		if c.children != nil {
-			t.Errorf("leaf %d has children: %v", i, c.children)
+		if c.kind != wantKinds[i] {
+			t.Errorf("child %d kind = %q, want %q", i, c.kind, wantKinds[i])
+		}
+		if c.kind == nkChars && c.children != nil {
+			t.Errorf("chars child %d has children: %v", i, c.children)
 		}
 	}
 }
@@ -325,9 +486,9 @@ func Test_ErrorMessage(t *testing.T) {
 
 func Test_RunReusable(t *testing.T) {
 	c := Seq(Char('a'), Char('b'))
-	match(t, "ab", c, "(a b)")
+	match(t, "ab", c, "(ab)")
 	noMatch(t, "ax", c, ErrGrammarMismatch)
-	match(t, "ab", c, "(a b)")
+	match(t, "ab", c, "(ab)")
 }
 
 func Test_MachineStack(t *testing.T) {
@@ -337,15 +498,111 @@ func Test_MachineStack(t *testing.T) {
 	m.push(b)
 	m.push(c)
 
-	if got := m.pop(); got != c {
-		t.Fatalf("pop = %v, want c", got)
-	}
-	got := m.popn(2)
-	if !slices.Equal(got, []*node{a, b}) {
-		t.Fatalf("popn(2) = %v, want [a b] in push order", got)
+	for _, want := range []*node{c, b, a} {
+		if got := m.pop(); got != want {
+			t.Fatalf("pop = %v, want %v", got, want)
+		}
 	}
 	if m.stack != nil {
 		t.Fatalf("stack = %v, want empty", m.stack)
+	}
+}
+
+// Consecutive chars join into one node; a mark or other node starts a new one.
+func Test_MachinePushChar(t *testing.T) {
+	m := &machine{}
+	m.pushChar('a')
+	m.pushChar('😀')
+	if m.stack.kind != nkChars || m.stack.lexeme != "a😀" {
+		t.Fatalf("top = %q %q, want chars \"a😀\"", m.stack.kind, m.stack.lexeme)
+	}
+	if m.stack.next != nil {
+		t.Fatalf("joined chars left %v below", m.stack.next)
+	}
+
+	m.push(&node{kind: nkMark})
+	m.pushChar('b')
+	if m.stack.lexeme != "b" || m.stack.next.kind != nkMark {
+		t.Fatalf("char after mark joined across it: top = %q", m.stack.lexeme)
+	}
+}
+
+// A fork shares the top node; extending it on one machine must not change
+// what the other sees.
+func Test_MachinePushCharShared(t *testing.T) {
+	m1 := &machine{}
+	m1.pushChar('a')
+	m2 := &machine{stack: m1.stack}
+
+	m1.pushChar('b')
+	m2.pushChar('c')
+
+	if m1.stack.lexeme != "ab" {
+		t.Errorf("m1 top = %q, want \"ab\"", m1.stack.lexeme)
+	}
+	if m2.stack.lexeme != "ac" {
+		t.Errorf("m2 top = %q, want \"ac\"", m2.stack.lexeme)
+	}
+}
+
+// popToMark stops at the nearest mark, discards it, and leaves anything below
+// it, including outer marks, on the stack.
+func Test_MachinePopToMark(t *testing.T) {
+	outer, inner := &node{kind: nkMark}, &node{kind: nkMark}
+	x, a, b := &node{lexeme: "x"}, &node{lexeme: "a"}, &node{lexeme: "b"}
+	m := &machine{}
+	for _, n := range []*node{outer, x, inner, a, b} {
+		m.push(n)
+	}
+
+	if got := m.popToMark(); !slices.Equal(got, []*node{a, b}) {
+		t.Fatalf("popToMark = %v, want [a b] in push order", got)
+	}
+	if m.stack != x {
+		t.Fatalf("top = %v, want x", m.stack)
+	}
+	if got := m.popToMark(); !slices.Equal(got, []*node{x}) {
+		t.Fatalf("popToMark = %v, want [x]", got)
+	}
+	if m.stack != nil {
+		t.Fatalf("stack = %v, want empty", m.stack)
+	}
+}
+
+// A mark directly on top yields no children; nil is acceptable.
+func Test_MachinePopToMarkEmpty(t *testing.T) {
+	below := &node{lexeme: "below"}
+	m := &machine{}
+	m.push(below)
+	m.push(&node{kind: nkMark})
+
+	if got := m.popToMark(); len(got) != 0 {
+		t.Fatalf("popToMark = %v, want empty", got)
+	}
+	if m.stack != below {
+		t.Fatalf("top = %v, want below", m.stack)
+	}
+}
+
+// appendPending keeps insertion order and clears a stale link left over from
+// the running list.
+func Test_AppendPending(t *testing.T) {
+	a, b, c := &machine{pc: 1}, &machine{pc: 2}, &machine{pc: 3}
+	a.next = c // stale link from the running list
+	var head, tail *machine
+	head, tail = appendPending(head, tail, a)
+	head, tail = appendPending(head, tail, b)
+	head, tail = appendPending(head, tail, c)
+
+	var got []int32
+	for m := head; m != nil; m = m.next {
+		got = append(got, m.pc)
+	}
+	if !slices.Equal(got, []int32{1, 2, 3}) {
+		t.Errorf("order = %v, want [1 2 3]", got)
+	}
+	if tail != c {
+		t.Errorf("tail = %v, want c", tail)
 	}
 }
 
@@ -363,11 +620,11 @@ func Test_MachineSharedTail(t *testing.T) {
 	}
 	m2.push(c)
 
-	if got := m1.popn(2); !slices.Equal(got, []*node{a, b}) {
-		t.Errorf("m1 popn(2) = %v, want [a b]", got)
+	if got := []*node{m1.pop(), m1.pop()}; !slices.Equal(got, []*node{b, a}) {
+		t.Errorf("m1 pops = %v, want [b a]", got)
 	}
-	if got := m2.popn(2); !slices.Equal(got, []*node{a, c}) {
-		t.Errorf("m2 popn(2) = %v, want [a c]", got)
+	if got := []*node{m2.pop(), m2.pop()}; !slices.Equal(got, []*node{c, a}) {
+		t.Errorf("m2 pops = %v, want [c a]", got)
 	}
 }
 
@@ -418,9 +675,10 @@ func run(t *testing.T, s string, c Compiler) (got *node, err error) {
 	return Run(c, []rune(s))
 }
 
-// Renders leaves as their lexeme and sequence nodes as a parenthesised list.
+// Renders chars nodes as their lexeme and sequence nodes as a parenthesised
+// list. Keyed on kind because an empty sequence has nil children.
 func show(s *node) string {
-	if s.children == nil {
+	if s.kind != nkSeq {
 		return s.lexeme
 	}
 	parts := make([]string, len(s.children))

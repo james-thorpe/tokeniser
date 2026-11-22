@@ -3,6 +3,7 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"slices"
 )
 
 var (
@@ -14,14 +15,17 @@ var (
 // VM operation kinds
 const (
 	opChar int32 = iota
-	opCat
+	opMark
+	opSeq
+	opFork
 	opEof
 )
 
 // Node kinds
 const (
-	nkChar = "char"
-	nkSeq  = "seq"
+	nkChars = "char"
+	nkMark  = "mark"
+	nkSeq   = "seq"
 )
 
 type node struct {
@@ -34,8 +38,10 @@ type node struct {
 // stack is the top of a linked list of nodes. Popping never clears next, so
 // stack tails remain immutable and can be shared between machines.
 type machine struct {
-	pc    int32
-	stack *node
+	parent *machine
+	next   *machine
+	pc     int32
+	stack  *node
 }
 
 func (m *machine) push(s *node) {
@@ -49,12 +55,24 @@ func (m *machine) pop() (tos *node) {
 	return
 }
 
-// popn returns nodes in push order, so the list is filled from the end.
-func (m *machine) popn(n int32) (tos []*node) {
-	tos = make([]*node, n)
-	for i := n - 1; i >= 0; i-- {
-		tos[i] = m.pop()
+// pushChar extends a chars node on top of the stack, or pushes a new one. The
+// top node is replaced rather than modified because forks share stack nodes.
+func (m *machine) pushChar(r rune) {
+	lexeme := string(r)
+	if m.stack != nil && m.stack.kind == nkChars {
+		lexeme = m.pop().lexeme + lexeme
 	}
+	m.push(&node{kind: nkChars, lexeme: lexeme})
+}
+
+// popToMark returns the nodes above the nearest mark in push order. The mark
+// itself is popped and discarded. Nodes are collected top-down, so the slice
+// is reversed before returning.
+func (m *machine) popToMark() (tos []*node) {
+	for s := m.pop(); s.kind != nkMark; s = m.pop() {
+		tos = append(tos, s)
+	}
+	slices.Reverse(tos)
 	return
 }
 
@@ -75,19 +93,17 @@ func Range(lo, hi rune) Compiler {
 	}
 }
 
-// Text panics on an empty string: it would emit no node, leaving opCat and
-// opEof to pop from a stack one short. Panicking here surfaces the grammar
-// error at construction rather than at Run.
+// Text panics on an empty string: it would match nothing and contribute no
+// node, which almost certainly indicates a grammar mistake. Panicking here
+// surfaces it at construction rather than as a silently empty match at Run.
 func Text(text string) Compiler {
 	if text == "" {
 		panic(ErrEmptyText)
 	}
 	return func(p *program) {
 		runes := []rune(text)
-		Char(runes[0])(p)
-		for _, r := range runes[1:] {
+		for _, r := range runes {
 			Char(r)(p)
-			op(p, opCat)
 		}
 	}
 }
@@ -95,17 +111,28 @@ func Text(text string) Compiler {
 // Seq converts its elements eagerly so that unsupported types and empty text
 // panic at construction, consistent with Text.
 func Seq(first any, rest ...any) Compiler {
-	cFirst := convertToCompiler(first)
-	cRest := make([]Compiler, len(rest))
-	for i, obj := range rest {
-		cRest[i] = convertToCompiler(obj)
-	}
+	convertedFirst := convertToCompiler(first)
+	convertedRest := convertToCompilers(rest)
 	return func(p *program) {
-		cFirst(p)
-		for _, c := range cRest {
-			c(p)
-			op(p, opCat)
+		op(p, opMark)
+		convertedFirst(p)
+		for _, compiler := range convertedRest {
+			compiler(p)
 		}
+		op(p, opSeq)
+	}
+}
+
+// Optional emits no node when the element is skipped; the enclosing opSeq
+// collects up to its mark, so it simply has one fewer child.
+func Optional(item any) Compiler {
+	converted := convertToCompiler(item)
+	return func(p *program) {
+		fork := len(*p)
+		op(p, opFork, 0)
+		converted(p)
+		// Target is only known once the element has been emitted.
+		(*p)[fork+1] = int32(len(*p))
 	}
 }
 
@@ -122,41 +149,73 @@ func convertToCompiler(obj any) Compiler {
 	}
 }
 
+func convertToCompilers(objs []any) []Compiler {
+	convertedRest := make([]Compiler, len(objs))
+	for i, item := range objs {
+		convertedRest[i] = convertToCompiler(item)
+	}
+	return convertedRest
+}
+
+// appendPending adds m at the tail so machine order, and with it match
+// priority, is the same on every step. Returns the updated head and tail.
+func appendPending(head, tail, m *machine) (*machine, *machine) {
+	m.next = nil
+	if tail == nil {
+		return m, m
+	}
+	tail.next = m
+	return head, m
+}
+
 func Run(c Compiler, runes []rune) (*node, error) {
 	prog := make(program, 0, 64)
 	c(&prog)         // compile state machine
 	op(&prog, opEof) // add eof check
 	start := &machine{}
-	running := make([]*machine, 0, 16)
-	pending := make([]*machine, 0, 16)
-	running = append(running, start)
+	running := start
+	var pending *machine = nil
+	var pendingTail *machine = nil
 	runes = append(runes, -1)
 	for i, r := range runes {
-		for _, m := range running {
+		// Drained until empty because opFork queues forks that must run on the
+		// same rune.
+		for running != nil {
+			m := running
+			running = running.next
 		loop:
 			op := prog[m.pc]
 			switch op {
 			case opChar:
 				if r >= prog[m.pc+1] && r <= prog[m.pc+2] {
 					m.pc += 3
-					m.push(&node{
-						kind:   nkChar,
-						lexeme: string(r),
-					})
-					pending = append(pending, m)
+					m.pushChar(r)
+					pending, pendingTail = appendPending(pending, pendingTail, m)
 				}
-			case opCat:
+			case opMark:
 				m.pc += 1
-				right := m.pop()
-				left := m.pop()
+				m.push(&node{kind: nkMark})
+				goto loop
+			case opSeq:
+				m.pc += 1
 				m.push(&node{
 					kind:     nkSeq,
-					children: []*node{left, right},
+					children: m.popToMark(),
 				})
+				goto loop
+			case opFork:
+				// The fork skips the optional element and shares the stack tail,
+				// which push never mutates. It is queued directly after m so it
+				// runs on this rune ahead of lower-priority machines.
+				running = &machine{pc: prog[m.pc+1], stack: m.stack, next: running}
+				m.pc += 2
 				goto loop
 			case opEof:
 				if r == -1 {
-					return m.pop(), nil
+					if m.stack != nil {
+						return m.pop(), nil
+					}
+					return nil, nil
 				}
 			}
 		}
@@ -165,11 +224,10 @@ func Run(c Compiler, runes []rune) (*node, error) {
 		}
 		// Fail at the first rune no machine accepts, rather than carrying on to
 		// end of input, so the error reports where the input diverged.
-		if len(pending) == 0 {
+		if pending == nil {
 			return nil, fmt.Errorf("%w: unexpected %q at offset %d", ErrGrammarMismatch, r, i)
 		}
-		running, pending = pending, running
-		pending = pending[:0]
+		running, pending, pendingTail = pending, nil, nil
 	}
 	return nil, nil // should never get here
 }
