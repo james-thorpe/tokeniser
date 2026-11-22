@@ -398,6 +398,40 @@ func Test_OptionalNested(t *testing.T) {
 	match(t, "ac", Optional(Seq('a', Optional(Seq('b')), Optional('c'))), "(ac)")
 }
 
+// Multiple elements are emitted after a single fork, so the jump skips them
+// all.
+func Test_OptionalMultiCompile(t *testing.T) {
+	compiles(t, Optional('a', "bc", Range('0', '9')),
+		opFork, 14,
+		opChar, 'a', 'a',
+		opChar, 'b', 'b',
+		opChar, 'c', 'c',
+		opChar, '0', '9')
+	compiles(t, Seq('x', Optional('a', Seq('b'))),
+		opMark,
+		opChar, 'x', 'x',
+		opFork, 14,
+		opChar, 'a', 'a',
+		opMark,
+		opChar, 'b', 'b',
+		opSeq,
+		opSeq)
+}
+
+// All elements match or none do; matched elements become children of the
+// enclosing sequence rather than being grouped.
+func Test_OptionalMulti(t *testing.T) {
+	c := Seq('x', Optional('a', Seq('b')), 'y')
+	match(t, "xaby", c, "(xa (b) y)")
+	match(t, "xy", c, "(xy)")
+	match(t, "ab", Optional('a', 'b'), "ab")
+	match(t, "", Seq(Optional('a', 'b')), "()")
+
+	noMatch(t, "xay", c, ErrGrammarMismatch)
+	noMatch(t, "xby", c, ErrGrammarMismatch)
+	noMatch(t, "a", Optional('a', 'b'), ErrUnexpectedEOI)
+}
+
 func Test_OptionalErrorOffset(t *testing.T) {
 	_, err := run(t, "axc", Seq('a', Optional('b'), 'c'))
 	want := `grammar mismatch: unexpected 'x' at offset 1`
@@ -408,12 +442,15 @@ func Test_OptionalErrorOffset(t *testing.T) {
 
 func Test_OptionalPanics(t *testing.T) {
 	cases := []struct {
-		name string
-		item any
-		want error
+		name  string
+		first any
+		rest  []any
+		want  error
 	}{
-		{"empty text", "", ErrEmptyText},
-		{"unsupported", 1, nil},
+		{"empty text", "", nil, ErrEmptyText},
+		{"empty text rest", 'a', []any{""}, ErrEmptyText},
+		{"unsupported", 1, nil, nil},
+		{"unsupported rest", 'a', []any{1}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -429,9 +466,147 @@ func Test_OptionalPanics(t *testing.T) {
 					t.Errorf("recovered %v, want %v", r, tc.want)
 				}
 			}()
-			Optional(tc.item)
+			Optional(tc.first, tc.rest...)
 		})
 	}
+}
+
+// The entry fork skips the loop; the backward fork after the body targets the
+// start of the body.
+func Test_ZeroOrMoreCompile(t *testing.T) {
+	compiles(t, ZeroOrMore('a'),
+		opFork, 7,
+		opChar, 'a', 'a',
+		opFork, 2)
+	compiles(t, Seq('x', ZeroOrMore('a', 'b')),
+		opMark,
+		opChar, 'x', 'x',
+		opFork, 14,
+		opChar, 'a', 'a',
+		opChar, 'b', 'b',
+		opFork, 6,
+		opSeq)
+}
+
+func Test_ZeroOrMore(t *testing.T) {
+	match(t, "a", ZeroOrMore('a'), "a")
+	match(t, "aaa", ZeroOrMore('a'), "aaa")
+	match(t, "123", ZeroOrMore(Range('0', '9')), "123")
+	match(t, "", Seq(ZeroOrMore('a')), "()")
+	match(t, "aa", Seq(ZeroOrMore(Seq('a'))), "((a) (a))")
+
+	noMatch(t, "b", ZeroOrMore('a'), ErrGrammarMismatch)
+	noMatch(t, "aab", ZeroOrMore('a'), ErrGrammarMismatch)
+}
+
+// Zero iterations at top level leave the stack empty: a match with no tree.
+func Test_ZeroOrMoreEmptyResult(t *testing.T) {
+	n, err := run(t, "", ZeroOrMore('a'))
+	if err != nil || n != nil {
+		t.Errorf("got %v, %v; want nil tree and nil error", n, err)
+	}
+}
+
+// Each iteration's nodes become children of the enclosing sequence.
+func Test_ZeroOrMoreInSeq(t *testing.T) {
+	c := Seq('x', ZeroOrMore(Seq('a')), 'y')
+	match(t, "xy", c, "(xy)")
+	match(t, "xay", c, "(x (a) y)")
+	match(t, "xaay", c, "(x (a) (a) y)")
+	match(t, "xaay", Seq('x', ZeroOrMore('a'), 'y'), "(xaay)")
+
+	noMatch(t, "xaa", c, ErrUnexpectedEOI)
+	noMatch(t, "xaby", c, ErrGrammarMismatch)
+}
+
+// Multiple elements repeat as a group.
+func Test_ZeroOrMoreMulti(t *testing.T) {
+	c := Seq(ZeroOrMore('a', Seq('b')))
+	match(t, "", c, "()")
+	match(t, "ab", c, "(a (b))")
+	match(t, "abab", c, "(a (b) a (b))")
+
+	noMatch(t, "aba", c, ErrUnexpectedEOI)
+	noMatch(t, "abb", c, ErrGrammarMismatch)
+}
+
+// The back-edge prefers another iteration, so the loop takes every match it
+// can before later elements are tried.
+func Test_ZeroOrMoreGreedy(t *testing.T) {
+	c := Seq(ZeroOrMore(Seq('a')), Optional('a'))
+	match(t, "a", c, "((a))")
+	match(t, "aa", c, "((a) (a))")
+	match(t, "ab", Seq(ZeroOrMore(Seq('a')), Optional('a'), 'b'), "((a) b)")
+}
+
+// A body that can match empty input must not loop forever; the pc dedup stops
+// the second empty iteration within a step.
+func Test_ZeroOrMoreNullable(t *testing.T) {
+	match(t, "", Seq(ZeroOrMore(Optional('a'))), "()")
+	match(t, "aa", Seq(ZeroOrMore(Optional('a'))), "(aa)")
+	match(t, "", Seq(ZeroOrMore(ZeroOrMore('a'))), "()")
+	match(t, "aa", Seq(ZeroOrMore(ZeroOrMore(Seq('a')))), "((a) (a))")
+}
+
+// The dedup table is sized to the program and reused across every step.
+func Test_ZeroOrMoreLong(t *testing.T) {
+	s := strings.Repeat("ab", 500)
+	match(t, s, ZeroOrMore("ab"), s)
+	noMatch(t, s+"a", ZeroOrMore("ab"), ErrUnexpectedEOI)
+}
+
+func Test_ZeroOrMoreErrorOffset(t *testing.T) {
+	_, err := run(t, "xaab", Seq('x', ZeroOrMore('a'), 'y'))
+	want := `grammar mismatch: unexpected 'b' at offset 3`
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v, want %q", err, want)
+	}
+}
+
+func Test_ZeroOrMorePanics(t *testing.T) {
+	cases := []struct {
+		name  string
+		first any
+		rest  []any
+		want  error
+	}{
+		{"empty text", "", nil, ErrEmptyText},
+		{"empty text rest", 'a', []any{""}, ErrEmptyText},
+		{"unsupported", 1, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("no panic")
+				}
+				if tc.want == nil {
+					return
+				}
+				if err, ok := r.(error); !ok || !errors.Is(err, tc.want) {
+					t.Errorf("recovered %v, want %v", r, tc.want)
+				}
+			}()
+			ZeroOrMore(tc.first, tc.rest...)
+		})
+	}
+}
+
+// Top-level Optional and ZeroOrMore can leave several nodes at end of input;
+// opEof wraps them in a seq node rather than returning only the last.
+func Test_EofMultipleNodes(t *testing.T) {
+	match(t, "aa", ZeroOrMore(Seq('a')), "((a) (a))")
+	match(t, "a", ZeroOrMore(Seq('a')), "(a)")
+	match(t, "ab", Optional('a', Seq('b')), "(a (b))")
+	match(t, "abab", ZeroOrMore('a', Seq('b')), "(a (b) a (b))")
+}
+
+// A single node is returned as is, not wrapped.
+func Test_EofSingleNode(t *testing.T) {
+	match(t, "abc", Text("abc"), "abc")
+	match(t, "aaa", ZeroOrMore('a'), "aaa")
+	match(t, "a", Optional(Seq('a')), "(a)")
 }
 
 // Sequence nodes are interior only; leaves are chars nodes carrying the
@@ -542,6 +717,29 @@ func Test_MachinePushCharShared(t *testing.T) {
 	}
 	if m2.stack.lexeme != "ac" {
 		t.Errorf("m2 top = %q, want \"ac\"", m2.stack.lexeme)
+	}
+}
+
+func Test_MachineResult(t *testing.T) {
+	a, b, c := &node{lexeme: "a"}, &node{lexeme: "b"}, &node{lexeme: "c"}
+
+	if got := (&machine{}).result(); got != nil {
+		t.Errorf("empty stack = %v, want nil", got)
+	}
+
+	m := &machine{}
+	m.push(a)
+	if got := m.result(); got != a {
+		t.Errorf("single = %v, want a", got)
+	}
+
+	m = &machine{}
+	for _, n := range []*node{a, b, c} {
+		m.push(n)
+	}
+	got := m.result()
+	if got.kind != nkSeq || !slices.Equal(got.children, []*node{a, b, c}) {
+		t.Errorf("multiple = %q %v, want seq [a b c] in push order", got.kind, got.children)
 	}
 }
 

@@ -76,6 +76,21 @@ func (m *machine) popToMark() (tos []*node) {
 	return
 }
 
+// result returns the parse tree at end of input. Top-level Optional and
+// ZeroOrMore can leave zero or several nodes: none yields nil, a single node
+// is returned as is, and several are wrapped in a seq node in push order.
+func (m *machine) result() *node {
+	if m.stack == nil || m.stack.next == nil {
+		return m.stack
+	}
+	var children []*node
+	for m.stack != nil {
+		children = append(children, m.pop())
+	}
+	slices.Reverse(children)
+	return &node{kind: nkSeq, children: children}
+}
+
 func op(p *program, ops ...int32) {
 	*p = append(*p, ops...)
 }
@@ -123,16 +138,43 @@ func Seq(first any, rest ...any) Compiler {
 	}
 }
 
-// Optional emits no node when the element is skipped; the enclosing opSeq
-// collects up to its mark, so it simply has one fewer child.
-func Optional(item any) Compiler {
-	converted := convertToCompiler(item)
+// Optional matches all of its elements or none of them. It adds no node of its
+// own: matched elements contribute directly to the enclosing opSeq, and when
+// skipped that sequence simply has fewer children.
+func Optional(first any, rest ...any) Compiler {
+	convertedFirst := convertToCompiler(first)
+	convertedRest := convertToCompilers(rest)
 	return func(p *program) {
 		fork := len(*p)
 		op(p, opFork, 0)
-		converted(p)
-		// Target is only known once the element has been emitted.
+		emit(p, convertedFirst, convertedRest)
+		// Target is only known once the elements have been emitted.
 		(*p)[fork+1] = int32(len(*p))
+	}
+}
+
+// ZeroOrMore matches its elements, as a group, any number of times. Like
+// Optional it adds no node of its own; each iteration's nodes become children
+// of the enclosing opSeq. The loop decision follows the body, so the body is
+// emitted once and a backward opFork forms the loop. Matching is greedy.
+func ZeroOrMore(first any, rest ...any) Compiler {
+	convertedFirst := convertToCompiler(first)
+	convertedRest := convertToCompilers(rest)
+	return func(p *program) {
+		exit := len(*p)
+		op(p, opFork, 0)
+		body := int32(len(*p))
+		emit(p, convertedFirst, convertedRest)
+		op(p, opFork, body)
+		// Target is only known once the loop has been emitted.
+		(*p)[exit+1] = int32(len(*p))
+	}
+}
+
+func emit(p *program, first Compiler, rest []Compiler) {
+	first(p)
+	for _, compiler := range rest {
+		compiler(p)
 	}
 }
 
@@ -174,6 +216,11 @@ func Run(c Compiler, runes []rune) (*node, error) {
 	op(&prog, opEof) // add eof check
 	start := &machine{}
 	running := start
+	// Step (rune index + 1) at which each pc was last entered. A later arrival
+	// at the same pc in the same step has the same future but lower priority,
+	// so it is dropped. Without this, a loop whose body can match empty input
+	// would fork forever.
+	entered := make([]int, len(prog))
 	var pending *machine = nil
 	var pendingTail *machine = nil
 	runes = append(runes, -1)
@@ -184,6 +231,10 @@ func Run(c Compiler, runes []rune) (*node, error) {
 			m := running
 			running = running.next
 		loop:
+			if entered[m.pc] == i+1 {
+				continue
+			}
+			entered[m.pc] = i + 1
 			op := prog[m.pc]
 			switch op {
 			case opChar:
@@ -204,18 +255,22 @@ func Run(c Compiler, runes []rune) (*node, error) {
 				})
 				goto loop
 			case opFork:
-				// The fork skips the optional element and shares the stack tail,
-				// which push never mutates. It is queued directly after m so it
-				// runs on this rune ahead of lower-priority machines.
-				running = &machine{pc: prog[m.pc+1], stack: m.stack, next: running}
-				m.pc += 2
+				// m takes the preferred path; the fork takes the other and shares
+				// the stack tail, which push never mutates. The fork is queued
+				// directly after m so it runs on this rune ahead of lower-priority
+				// machines. Falling through is preferred, except on a backward
+				// fork (a loop back-edge), where staying in the loop is preferred
+				// so repetition is greedy.
+				target, next := prog[m.pc+1], m.pc+2
+				if target < m.pc {
+					target, next = next, target
+				}
+				running = &machine{pc: target, stack: m.stack, next: running}
+				m.pc = next
 				goto loop
 			case opEof:
 				if r == -1 {
-					if m.stack != nil {
-						return m.pop(), nil
-					}
-					return nil, nil
+					return m.result(), nil
 				}
 			}
 		}
