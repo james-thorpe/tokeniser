@@ -3,12 +3,10 @@ package parser
 import (
 	"errors"
 	"fmt"
-	"slices"
 )
 
 var (
 	ErrUnexpectedEOI   = errors.New("unexpected end of input")
-	ErrNonCharInText   = errors.New("non-character found in text")
 	ErrGrammarMismatch = errors.New("grammar mismatch")
 	ErrEmptyText       = errors.New("empty text")
 )
@@ -16,17 +14,13 @@ var (
 // VM operation kinds
 const (
 	opChar int32 = iota
-	opRange
-	opText
-	opSeq
-	opJmp
+	opCat
 	opEof
 )
 
 // Node kinds
 const (
 	nkChar = "char"
-	nkText = "text"
 	nkSeq  = "seq"
 )
 
@@ -34,30 +28,33 @@ type node struct {
 	kind     string
 	children []*node
 	lexeme   string
+	next     *node // stack link
 }
 
+// stack is the top of a linked list of nodes. Popping never clears next, so
+// stack tails remain immutable and can be shared between machines.
 type machine struct {
 	pc    int32
-	stack []*node
+	stack *node
 }
 
 func (m *machine) push(s *node) {
-	m.stack = append(m.stack, s)
+	s.next = m.stack
+	m.stack = s
 }
 
 func (m *machine) pop() (tos *node) {
-	top := len(m.stack) - 1
-	tos = m.stack[top]
-	m.stack = m.stack[:top]
+	tos = m.stack
+	m.stack = tos.next
 	return
 }
 
+// popn returns nodes in push order, so the list is filled from the end.
 func (m *machine) popn(n int32) (tos []*node) {
-	top := len(m.stack) - int(n)
-	// Copied because the caller pushes immediately, which would otherwise
-	// overwrite the returned states through the shared backing array.
-	tos = slices.Clone(m.stack[top:])
-	m.stack = m.stack[:top]
+	tos = make([]*node, n)
+	for i := n - 1; i >= 0; i-- {
+		tos[i] = m.pop()
+	}
 	return
 }
 
@@ -69,18 +66,16 @@ type program []int32
 type Compiler func(p *program)
 
 func Char(r rune) Compiler {
-	return func(p *program) {
-		op(p, opChar, r)
-	}
+	return Range(r, r)
 }
 
 func Range(lo, hi rune) Compiler {
 	return func(p *program) {
-		op(p, opRange, lo, hi)
+		op(p, opChar, lo, hi)
 	}
 }
 
-// Text panics on an empty string: it would emit no node, leaving opSeq and
+// Text panics on an empty string: it would emit no node, leaving opCat and
 // opEof to pop from a stack one short. Panicking here surfaces the grammar
 // error at construction rather than at Run.
 func Text(text string) Compiler {
@@ -88,22 +83,42 @@ func Text(text string) Compiler {
 		panic(ErrEmptyText)
 	}
 	return func(p *program) {
-		i := 0
-		for _, r := range text {
-			op(p, opChar, r)
-			i++
+		runes := []rune(text)
+		Char(runes[0])(p)
+		for _, r := range runes[1:] {
+			Char(r)(p)
+			op(p, opCat)
 		}
-		op(p, opText, int32(i))
 	}
 }
 
-func Seq(first Compiler, rest ...Compiler) Compiler {
+// Seq converts its elements eagerly so that unsupported types and empty text
+// panic at construction, consistent with Text.
+func Seq(first any, rest ...any) Compiler {
+	cFirst := convertToCompiler(first)
+	cRest := make([]Compiler, len(rest))
+	for i, obj := range rest {
+		cRest[i] = convertToCompiler(obj)
+	}
 	return func(p *program) {
-		first(p)
-		for _, compiler := range rest {
-			compiler(p)
+		cFirst(p)
+		for _, c := range cRest {
+			c(p)
+			op(p, opCat)
 		}
-		op(p, opSeq, int32(len(rest)+1))
+	}
+}
+
+func convertToCompiler(obj any) Compiler {
+	switch v := obj.(type) {
+	case Compiler:
+		return v
+	case string:
+		return Text(v)
+	case rune:
+		return Char(v)
+	default:
+		panic("unable to convert to compiler") // coding error not runtime error
 	}
 }
 
@@ -111,10 +126,7 @@ func Run(c Compiler, runes []rune) (*node, error) {
 	prog := make(program, 0, 64)
 	c(&prog)         // compile state machine
 	op(&prog, opEof) // add eof check
-	start := &machine{
-		pc:    0,
-		stack: make([]*node, 0, 16),
-	}
+	start := &machine{}
 	running := make([]*machine, 0, 16)
 	pending := make([]*machine, 0, 16)
 	running = append(running, start)
@@ -125,15 +137,6 @@ func Run(c Compiler, runes []rune) (*node, error) {
 			op := prog[m.pc]
 			switch op {
 			case opChar:
-				if r == prog[m.pc+1] {
-					m.pc += 2
-					m.push(&node{
-						kind:   nkChar,
-						lexeme: string(r),
-					})
-					pending = append(pending, m)
-				}
-			case opRange:
 				if r >= prog[m.pc+1] && r <= prog[m.pc+2] {
 					m.pc += 3
 					m.push(&node{
@@ -142,30 +145,15 @@ func Run(c Compiler, runes []rune) (*node, error) {
 					})
 					pending = append(pending, m)
 				}
-			case opText:
-				len := prog[m.pc+1]
-				m.pc += 2
-				children := m.popn(len)
-				s := &node{
-					kind:   nkText,
-					lexeme: "",
-				}
-				for _, child := range children {
-					if child.kind != nkChar && child.kind != nkText {
-						return nil, fmt.Errorf("%w at offset %d", ErrNonCharInText, i)
-					}
-					s.lexeme = s.lexeme + child.lexeme
-				}
-				m.push(s)
-				goto loop
-			case opSeq:
-				len := prog[m.pc+1]
-				m.pc += 2
+			case opCat:
+				m.pc += 1
+				right := m.pop()
+				left := m.pop()
 				m.push(&node{
 					kind:     nkSeq,
-					children: m.popn(len),
+					children: []*node{left, right},
 				})
-				goto loop // didn't consume anything so try next operation
+				goto loop
 			case opEof:
 				if r == -1 {
 					return m.pop(), nil
