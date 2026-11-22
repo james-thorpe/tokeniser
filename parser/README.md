@@ -2,15 +2,19 @@
 
 ## Result tree
 
-`Run` returns a tree of `*node` values with two kinds:
+`Run` returns a tree of `*Node` values. The parser produces two kinds itself;
+`Token` produces leaves of a caller-supplied kind:
 
 | Kind      | Meaning                                             |
 |-----------|-----------------------------------------------------|
-| `nkChars` | Leaf. `lexeme` holds the matched characters.        |
-| `nkSeq`   | Interior. `children` holds the nodes it collected.  |
+| `NkChars` | Leaf. `Lexeme` holds the matched characters.        |
+| `NkSeq`   | Interior. `Children` holds the nodes it collected.  |
 
-The examples below render chars nodes as their lexeme and seq nodes as a
-parenthesised, space-separated list of children.
+Kinds are `int32`. The parser's own kinds are negative; zero and positive
+values are reserved for user-defined kinds.
+
+The examples below render leaf nodes as their lexeme and seq nodes as a
+parenthesised, space-separated list of children. `K` stands for any kind.
 
 ### Nodes contributed by each element
 
@@ -18,6 +22,7 @@ parenthesised, space-separated list of children.
 |--------------------------|--------------------------------------------------------------|
 | `Char`, `Range`, `Text`  | Characters, merged into the adjacent chars node (see below). |
 | `Seq`                    | Exactly one seq node holding its elements' nodes.            |
+| `Token`                  | Exactly one leaf of the given kind holding every character matched within. |
 | `Optional`               | Its elements' nodes when matched, nothing when skipped.      |
 | `ZeroOrMore`             | Its elements' nodes once per iteration, nothing for zero.    |
 | `OneOrMore`              | Its elements' nodes once per iteration; at least one.        |
@@ -44,7 +49,7 @@ alternative; group an alternative of several elements with `Seq`.
 A matched character is appended to the chars node on top of the stack if
 there is one; otherwise a new chars node is pushed. Adjacent characters
 therefore form a single leaf regardless of which elements matched them. Only a
-`Seq` boundary separates them.
+`Seq` or `Token` boundary separates them.
 
 | Grammar                         | Input   | Tree        |
 |---------------------------------|---------|-------------|
@@ -52,6 +57,25 @@ therefore form a single leaf regardless of which elements matched them. Only a
 | `Seq('a', Range('0', '9'), 'b')`| `a5b`   | `(a5b)`     |
 | `Seq("ab", Optional("cd"), 'e')`| `abcde` | `(abcde)`   |
 | `Seq('a', Seq('b'), 'c')`       | `abc`   | `(a (b) c)` |
+| `Seq('a', Token(K, 'b'), 'c')`  | `abc`   | `(a b c)`   |
+
+### Tokens
+
+`Token(kind, ...)` matches its elements as `Seq` does, then replaces
+everything they produced with a single leaf node of `kind`. Its lexeme is the
+concatenation, in match order, of every character matched beneath it, however
+deeply nested in `Seq` or `Token` nodes. A token that matches nothing yields a
+node with an empty lexeme.
+
+A token node is sealed: characters matched after it start a new chars node
+rather than extending it, so adjacent tokens stay distinct. This holds even
+when `kind` is `NkChars`.
+
+| Grammar                                         | Input  | Tree       |
+|-------------------------------------------------|--------|------------|
+| `Token(K, 'a', Seq('b'), 'c')`                  | `abc`  | `abc`      |
+| `Seq('x', Token(K, Seq('a'), Seq('b')), 'y')`   | `xaby` | `(x ab y)` |
+| `Seq(Token(K, 'a'), Token(K, 'b'))`             | `ab`   | `(a b)`    |
 
 ### Root
 

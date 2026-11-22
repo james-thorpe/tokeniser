@@ -136,16 +136,17 @@ func Test_NodeKinds(t *testing.T) {
 		name  string
 		input string
 		c     Compiler
-		want  string
+		want  int32
 	}{
-		{"char", "a", Char('a'), nkChars},
-		{"range", "a", Range('a', 'z'), nkChars},
-		{"seq single", "a", Seq(Char('a')), nkSeq},
-		{"seq", "ab", Seq(Char('a'), Char('b')), nkSeq},
-		{"text single", "a", Text("a"), nkChars},
-		{"text", "ab", Text("ab"), nkChars},
-		{"optional present", "a", Optional('a'), nkChars},
-		{"seq of skipped optional", "", Seq(Optional('a')), nkSeq},
+		{"char", "a", Char('a'), NkChars},
+		{"range", "a", Range('a', 'z'), NkChars},
+		{"seq single", "a", Seq(Char('a')), NkSeq},
+		{"seq", "ab", Seq(Char('a'), Char('b')), NkSeq},
+		{"text single", "a", Text("a"), NkChars},
+		{"text", "ab", Text("ab"), NkChars},
+		{"optional present", "a", Optional('a'), NkChars},
+		{"seq of skipped optional", "", Seq(Optional('a')), NkSeq},
+		{"token", "ab", Token(nkWord, 'a', Seq('b')), nkWord},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -156,8 +157,8 @@ func Test_NodeKinds(t *testing.T) {
 			if n == nil {
 				t.Fatal("nil tree")
 			}
-			if n.kind != tc.want {
-				t.Errorf("kind = %q, want %q", n.kind, tc.want)
+			if n.Kind != tc.want {
+				t.Errorf("kind = %d, want %d", n.Kind, tc.want)
 			}
 		})
 	}
@@ -809,6 +810,114 @@ func Test_ChoicePanics(t *testing.T) {
 	}
 }
 
+// User-defined kinds for Token tests.
+const (
+	nkWord int32 = iota
+	nkNumber
+)
+
+// Token brackets its elements like Seq but closes with opToken and its kind.
+func Test_TokenCompile(t *testing.T) {
+	compiles(t, Token(nkWord, Char('a')), opMark, opChar, 'a', 'a', opToken, nkWord)
+	compiles(t, Token(nkNumber, Seq(Char('1')), Char('2')),
+		opMark,
+		opMark,
+		opChar, '1', '1',
+		opSeq,
+		opChar, '2', '2',
+		opToken, nkNumber)
+}
+
+// Nested sequences, however deep, collapse into one leaf node.
+func Test_Token(t *testing.T) {
+	match(t, "a", Token(nkWord, 'a'), "a")
+	match(t, "abc", Token(nkWord, 'a', Seq('b'), 'c'), "abc")
+	match(t, "abcd", Token(nkWord, Seq('a', Seq('b', Seq('c'))), 'd'), "abcd")
+	match(t, "xaby", Seq('x', Token(nkWord, Seq('a'), Seq('b')), 'y'), "(x ab y)")
+	match(t, "aaa", Token(nkWord, ZeroOrMore(Seq('a'))), "aaa")
+	match(t, "b", Token(nkWord, Choice(Seq('a'), Seq('b'))), "b")
+	match(t, "a1c", Token(nkWord, 'a', Token(nkNumber, '1'), 'c'), "a1c")
+
+	noMatch(t, "", Token(nkWord, 'a'), ErrUnexpectedEOI)
+	noMatch(t, "ax", Token(nkWord, 'a', Seq('b')), ErrGrammarMismatch)
+}
+
+// A token is sealed: neighbouring characters, and neighbouring tokens, stay
+// separate nodes rather than merging into it, even when its kind is NkChars.
+func Test_TokenBoundary(t *testing.T) {
+	number := Token(nkNumber, OneOrMore(Range('0', '9')))
+	match(t, "abc", Seq('a', Token(nkWord, 'b'), 'c'), "(a b c)")
+	match(t, "abc", Seq('a', Token(NkChars, 'b'), 'c'), "(a b c)")
+	match(t, "ab", Seq(Token(NkChars, 'a'), Token(NkChars, 'b')), "(a b)")
+	match(t, "12+34", Seq(number, '+', number), "(12 + 34)")
+}
+
+func Test_TokenNodeShape(t *testing.T) {
+	n, err := run(t, "abc", Token(nkWord, 'a', Seq('b'), 'c'))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Kind != nkWord || n.Lexeme != "abc" || n.Children != nil {
+		t.Errorf("token = %d %q %v, want word \"abc\" with no children", n.Kind, n.Lexeme, n.Children)
+	}
+}
+
+func Test_TokenKinds(t *testing.T) {
+	n, err := run(t, "ab1", Seq(Token(nkWord, OneOrMore(Range('a', 'z'))), Token(nkNumber, Range('0', '9'))))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(n.Children) != 2 {
+		t.Fatalf("children = %d, want 2", len(n.Children))
+	}
+	if w, d := n.Children[0], n.Children[1]; w.Kind != nkWord || d.Kind != nkNumber {
+		t.Errorf("kinds = %d %d, want %d %d", w.Kind, d.Kind, nkWord, nkNumber)
+	}
+}
+
+// A token that matches nothing still leaves a node, as an empty Seq does.
+func Test_TokenEmpty(t *testing.T) {
+	n, err := run(t, "", Token(nkWord, Optional('a')))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n == nil || n.Kind != nkWord || n.Lexeme != "" {
+		t.Errorf("token = %v, want empty word node", n)
+	}
+	match(t, "xy", Seq('x', Token(nkWord, Optional('a')), 'y'), "(x  y)")
+}
+
+// The integer part is required, so ".5" is rejected; the mantissa requires
+// digits after the point, so "1." is rejected.
+func Test_FloatingPoint(t *testing.T) {
+	digit := Range('0', '9')
+	integer := OneOrMore(digit)
+	sign := Choice('+', '-')
+	mantissa := Seq('.', integer)
+	exponent := Seq(Choice('e', 'E'), Optional(sign), integer)
+	float := Token(nkNumber, Optional(sign), integer, Optional(mantissa), Optional(exponent))
+
+	match(t, "0", float, "0")
+	match(t, "42", float, "42")
+	match(t, "3.14", float, "3.14")
+	match(t, "-3.14", float, "-3.14")
+	match(t, "1e10", float, "1e10")
+	match(t, "1.5e-3", float, "1.5e-3")
+	match(t, "+6.02E+23", float, "+6.02E+23")
+
+	noMatch(t, "", float, ErrUnexpectedEOI)
+	noMatch(t, "-", float, ErrUnexpectedEOI)
+	noMatch(t, "1.", float, ErrUnexpectedEOI)
+	noMatch(t, "1e", float, ErrUnexpectedEOI)
+	noMatch(t, "1e+", float, ErrUnexpectedEOI)
+	noMatch(t, ".", float, ErrGrammarMismatch)
+	noMatch(t, ".5", float, ErrGrammarMismatch)
+	noMatch(t, "e5", float, ErrGrammarMismatch)
+	noMatch(t, "--1", float, ErrGrammarMismatch)
+	noMatch(t, "1.2.3", float, ErrGrammarMismatch)
+	noMatch(t, "1x", float, ErrGrammarMismatch)
+}
+
 // Top-level Optional and ZeroOrMore can leave several nodes at end of input;
 // opEof wraps them in a seq node rather than returning only the last.
 func Test_EofMultipleNodes(t *testing.T) {
@@ -835,19 +944,19 @@ func Test_SeqNodeShape(t *testing.T) {
 	if s == nil {
 		t.Fatal("nil tree")
 	}
-	if s.kind != nkSeq || s.lexeme != "" {
-		t.Errorf("root = %q %q, want seq with empty lexeme", s.kind, s.lexeme)
+	if s.Kind != NkSeq || s.Lexeme != "" {
+		t.Errorf("root = %d %q, want seq with empty lexeme", s.Kind, s.Lexeme)
 	}
-	wantKinds := []string{nkChars, nkSeq, nkChars}
-	if len(s.children) != len(wantKinds) {
-		t.Fatalf("children = %d, want %d", len(s.children), len(wantKinds))
+	wantKinds := []int32{NkChars, NkSeq, NkChars}
+	if len(s.Children) != len(wantKinds) {
+		t.Fatalf("children = %d, want %d", len(s.Children), len(wantKinds))
 	}
-	for i, c := range s.children {
-		if c.kind != wantKinds[i] {
-			t.Errorf("child %d kind = %q, want %q", i, c.kind, wantKinds[i])
+	for i, c := range s.Children {
+		if c.Kind != wantKinds[i] {
+			t.Errorf("child %d kind = %d, want %d", i, c.Kind, wantKinds[i])
 		}
-		if c.kind == nkChars && c.children != nil {
-			t.Errorf("chars child %d has children: %v", i, c.children)
+		if c.Kind == NkChars && c.Children != nil {
+			t.Errorf("chars child %d has Children: %v", i, c.Children)
 		}
 	}
 }
@@ -883,13 +992,13 @@ func Test_RunReusable(t *testing.T) {
 }
 
 func Test_MachineStack(t *testing.T) {
-	a, b, c := &node{lexeme: "a"}, &node{lexeme: "b"}, &node{lexeme: "c"}
+	a, b, c := &Node{Lexeme: "a"}, &Node{Lexeme: "b"}, &Node{Lexeme: "c"}
 	m := &machine{}
 	m.push(a)
 	m.push(b)
 	m.push(c)
 
-	for _, want := range []*node{c, b, a} {
+	for _, want := range []*Node{c, b, a} {
 		if got := m.pop(); got != want {
 			t.Fatalf("pop = %v, want %v", got, want)
 		}
@@ -904,17 +1013,17 @@ func Test_MachinePushChar(t *testing.T) {
 	m := &machine{}
 	m.pushChar('a')
 	m.pushChar('😀')
-	if m.tos.kind != nkChars || m.tos.lexeme != "a😀" {
-		t.Fatalf("top = %q %q, want chars \"a😀\"", m.tos.kind, m.tos.lexeme)
+	if m.tos.Kind != NkChars || m.tos.Lexeme != "a😀" {
+		t.Fatalf("top = %d %q, want chars \"a😀\"", m.tos.Kind, m.tos.Lexeme)
 	}
 	if m.tos.nos != nil {
 		t.Fatalf("joined chars left %v below", m.tos.nos)
 	}
 
-	m.push(&node{kind: nkMark})
+	m.push(&Node{Kind: nkMark})
 	m.pushChar('b')
-	if m.tos.lexeme != "b" || m.tos.nos.kind != nkMark {
-		t.Fatalf("char after mark joined across it: top = %q", m.tos.lexeme)
+	if m.tos.Lexeme != "b" || m.tos.nos.Kind != nkMark {
+		t.Fatalf("char after mark joined across it: top = %q", m.tos.Lexeme)
 	}
 }
 
@@ -928,16 +1037,16 @@ func Test_MachinePushCharShared(t *testing.T) {
 	m1.pushChar('b')
 	m2.pushChar('c')
 
-	if m1.tos.lexeme != "ab" {
-		t.Errorf("m1 top = %q, want \"ab\"", m1.tos.lexeme)
+	if m1.tos.Lexeme != "ab" {
+		t.Errorf("m1 top = %q, want \"ab\"", m1.tos.Lexeme)
 	}
-	if m2.tos.lexeme != "ac" {
-		t.Errorf("m2 top = %q, want \"ac\"", m2.tos.lexeme)
+	if m2.tos.Lexeme != "ac" {
+		t.Errorf("m2 top = %q, want \"ac\"", m2.tos.Lexeme)
 	}
 }
 
 func Test_MachineResult(t *testing.T) {
-	a, b, c := &node{lexeme: "a"}, &node{lexeme: "b"}, &node{lexeme: "c"}
+	a, b, c := &Node{Lexeme: "a"}, &Node{Lexeme: "b"}, &Node{Lexeme: "c"}
 
 	if got := (&machine{}).result(); got != nil {
 		t.Errorf("empty stack = %v, want nil", got)
@@ -950,32 +1059,32 @@ func Test_MachineResult(t *testing.T) {
 	}
 
 	m = &machine{}
-	for _, n := range []*node{a, b, c} {
+	for _, n := range []*Node{a, b, c} {
 		m.push(n)
 	}
 	got := m.result()
-	if got.kind != nkSeq || !slices.Equal(got.children, []*node{a, b, c}) {
-		t.Errorf("multiple = %q %v, want seq [a b c] in push order", got.kind, got.children)
+	if got.Kind != NkSeq || !slices.Equal(got.Children, []*Node{a, b, c}) {
+		t.Errorf("multiple = %d %v, want seq [a b c] in push order", got.Kind, got.Children)
 	}
 }
 
 // popToMark stops at the nearest mark, discards it, and leaves anything below
 // it, including outer marks, on the stack.
 func Test_MachinePopToMark(t *testing.T) {
-	outer, inner := &node{kind: nkMark}, &node{kind: nkMark}
-	x, a, b := &node{lexeme: "x"}, &node{lexeme: "a"}, &node{lexeme: "b"}
+	outer, inner := &Node{Kind: nkMark}, &Node{Kind: nkMark}
+	x, a, b := &Node{Lexeme: "x"}, &Node{Lexeme: "a"}, &Node{Lexeme: "b"}
 	m := &machine{}
-	for _, n := range []*node{outer, x, inner, a, b} {
+	for _, n := range []*Node{outer, x, inner, a, b} {
 		m.push(n)
 	}
 
-	if got := m.popToMark(); !slices.Equal(got, []*node{a, b}) {
+	if got := m.popToMark(); !slices.Equal(got, []*Node{a, b}) {
 		t.Fatalf("popToMark = %v, want [a b] in push order", got)
 	}
 	if m.tos != x {
 		t.Fatalf("top = %v, want x", m.tos)
 	}
-	if got := m.popToMark(); !slices.Equal(got, []*node{x}) {
+	if got := m.popToMark(); !slices.Equal(got, []*Node{x}) {
 		t.Fatalf("popToMark = %v, want [x]", got)
 	}
 	if m.tos != nil {
@@ -985,10 +1094,10 @@ func Test_MachinePopToMark(t *testing.T) {
 
 // A mark directly on top yields no children; nil is acceptable.
 func Test_MachinePopToMarkEmpty(t *testing.T) {
-	below := &node{lexeme: "below"}
+	below := &Node{Lexeme: "below"}
 	m := &machine{}
 	m.push(below)
-	m.push(&node{kind: nkMark})
+	m.push(&Node{Kind: nkMark})
 
 	if got := m.popToMark(); len(got) != 0 {
 		t.Fatalf("popToMark = %v, want empty", got)
@@ -1023,7 +1132,7 @@ func Test_AppendPending(t *testing.T) {
 // Machines sharing a stack tail must not disturb each other: popping leaves
 // the popped node's link intact.
 func Test_MachineSharedTail(t *testing.T) {
-	a, b, c := &node{lexeme: "a"}, &node{lexeme: "b"}, &node{lexeme: "c"}
+	a, b, c := &Node{Lexeme: "a"}, &Node{Lexeme: "b"}, &Node{Lexeme: "c"}
 	m1 := &machine{}
 	m1.push(a)
 	m1.push(b)
@@ -1034,10 +1143,10 @@ func Test_MachineSharedTail(t *testing.T) {
 	}
 	m2.push(c)
 
-	if got := []*node{m1.pop(), m1.pop()}; !slices.Equal(got, []*node{b, a}) {
+	if got := []*Node{m1.pop(), m1.pop()}; !slices.Equal(got, []*Node{b, a}) {
 		t.Errorf("m1 pops = %v, want [b a]", got)
 	}
-	if got := []*node{m2.pop(), m2.pop()}; !slices.Equal(got, []*node{c, a}) {
+	if got := []*Node{m2.pop(), m2.pop()}; !slices.Equal(got, []*Node{c, a}) {
 		t.Errorf("m2 pops = %v, want [c a]", got)
 	}
 }
@@ -1079,7 +1188,7 @@ func noMatch(t *testing.T, s string, c Compiler, want error) {
 }
 
 // Recovers so a VM panic fails only the offending case.
-func run(t *testing.T, s string, c Compiler) (got *node, err error) {
+func run(t *testing.T, s string, c Compiler) (got *Node, err error) {
 	t.Helper()
 	defer func() {
 		if r := recover(); r != nil {
@@ -1091,12 +1200,12 @@ func run(t *testing.T, s string, c Compiler) (got *node, err error) {
 
 // Renders chars nodes as their lexeme and sequence nodes as a parenthesised
 // list. Keyed on kind because an empty sequence has nil children.
-func show(s *node) string {
-	if s.kind != nkSeq {
-		return s.lexeme
+func show(s *Node) string {
+	if s.Kind != NkSeq {
+		return s.Lexeme
 	}
-	parts := make([]string, len(s.children))
-	for i, c := range s.children {
+	parts := make([]string, len(s.Children))
+	for i, c := range s.Children {
 		parts[i] = show(c)
 	}
 	return "(" + strings.Join(parts, " ") + ")"

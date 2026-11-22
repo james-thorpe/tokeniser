@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 var (
@@ -17,23 +18,26 @@ const (
 	opChar int32 = iota
 	opMark
 	opSeq
+	opToken
 	opFork
 	opJmp
 	opEof
 )
 
-// Node kinds
+// Node kinds. Negative values are reserved for the parser; zero and positive
+// values are left for user-defined kinds.
 const (
-	nkChars = "char"
-	nkMark  = "mark"
-	nkSeq   = "seq"
+	NkChars int32 = -(iota + 1)
+	nkMark
+	NkSeq
 )
 
-type node struct {
-	kind     string
-	children []*node
-	lexeme   string
-	nos      *node // next on stack
+type Node struct {
+	Kind     int32
+	Children []*Node
+	Lexeme   string
+	nos      *Node // next on stack
+	sealed   bool  // set on Token nodes so later chars start a new node
 }
 
 // tos is the top of a linked list of nodes. Popping never clears next, so
@@ -42,15 +46,15 @@ type machine struct {
 	parent *machine
 	next   *machine
 	pc     int32
-	tos    *node // top of stack
+	tos    *Node // top of stack
 }
 
-func (m *machine) push(s *node) {
+func (m *machine) push(s *Node) {
 	s.nos = m.tos
 	m.tos = s
 }
 
-func (m *machine) pop() (tos *node) {
+func (m *machine) pop() (tos *Node) {
 	tos = m.tos
 	m.tos = tos.nos
 	return
@@ -60,17 +64,17 @@ func (m *machine) pop() (tos *node) {
 // top node is replaced rather than modified because forks share tos nodes.
 func (m *machine) pushChar(r rune) {
 	lexeme := string(r)
-	if m.tos != nil && m.tos.kind == nkChars {
-		lexeme = m.pop().lexeme + lexeme
+	if m.tos != nil && m.tos.Kind == NkChars && !m.tos.sealed {
+		lexeme = m.pop().Lexeme + lexeme
 	}
-	m.push(&node{kind: nkChars, lexeme: lexeme})
+	m.push(&Node{Kind: NkChars, Lexeme: lexeme})
 }
 
 // popToMark returns the nodes above the nearest mark in push order. The mark
 // itself is popped and discarded. Nodes are collected top-down, so the slice
 // is reversed before returning.
-func (m *machine) popToMark() (tos []*node) {
-	for s := m.pop(); s.kind != nkMark; s = m.pop() {
+func (m *machine) popToMark() (tos []*Node) {
+	for s := m.pop(); s.Kind != nkMark; s = m.pop() {
 		tos = append(tos, s)
 	}
 	slices.Reverse(tos)
@@ -80,16 +84,16 @@ func (m *machine) popToMark() (tos []*node) {
 // result returns the parse tree at end of input. Top-level Optional and
 // ZeroOrMore can leave zero or several nodes: none yields nil, a single node
 // is returned as is, and several are wrapped in a seq node in push order.
-func (m *machine) result() *node {
+func (m *machine) result() *Node {
 	if m.tos == nil || m.tos.nos == nil {
 		return m.tos
 	}
-	var children []*node
+	var children []*Node
 	for m.tos != nil {
 		children = append(children, m.pop())
 	}
 	slices.Reverse(children)
-	return &node{kind: nkSeq, children: children}
+	return &Node{Kind: NkSeq, Children: children}
 }
 
 func op(p *program, ops ...int32) {
@@ -136,6 +140,28 @@ func Seq(first any, rest ...any) Compiler {
 			compiler(p)
 		}
 		op(p, opSeq)
+	}
+}
+
+// Token matches its elements like Seq but leaves a single leaf node of the
+// given kind whose lexeme is every character matched beneath it, in order,
+// however deeply nested. The node is sealed so that, even when kind is
+// NkChars, characters matched after it start a new node instead of extending
+// the token. A token that matches nothing yields a node with an empty lexeme.
+func Token(kind int32, first any, rest ...any) Compiler {
+	convertedFirst := convertToCompiler(first)
+	convertedRest := convertToCompilers(rest)
+	return func(p *program) {
+		op(p, opMark)
+		emit(p, convertedFirst, convertedRest)
+		op(p, opToken, kind)
+	}
+}
+
+func flatten(b *strings.Builder, nodes []*Node) {
+	for _, n := range nodes {
+		b.WriteString(n.Lexeme)
+		flatten(b, n.Children)
 	}
 }
 
@@ -248,7 +274,7 @@ func appendPending(head, tail, m *machine) (*machine, *machine) {
 	return head, m
 }
 
-func Run(c Compiler, runes []rune) (*node, error) {
+func Run(c Compiler, runes []rune) (*Node, error) {
 	prog := make(program, 0, 64)
 	c(&prog)         // compile state machine
 	op(&prog, opEof) // add eof check
@@ -258,7 +284,7 @@ func Run(c Compiler, runes []rune) (*node, error) {
 	// at the same pc in the same step has the same future but lower priority,
 	// so it is dropped. Without this, a loop whose body can match empty input
 	// would fork forever.
-	entered := make([]int, len(prog))
+	entered := make([]int, len(prog)) // don't forget this is initialised to 0s
 	var pending *machine = nil
 	var pendingTail *machine = nil
 	runes = append(runes, -1)
@@ -283,14 +309,21 @@ func Run(c Compiler, runes []rune) (*node, error) {
 				}
 			case opMark:
 				m.pc += 1
-				m.push(&node{kind: nkMark})
+				m.push(&Node{Kind: nkMark})
 				goto loop
 			case opSeq:
 				m.pc += 1
-				m.push(&node{
-					kind:     nkSeq,
-					children: m.popToMark(),
+				m.push(&Node{
+					Kind:     NkSeq,
+					Children: m.popToMark(),
 				})
+				goto loop
+			case opToken:
+				kind := prog[m.pc+1]
+				m.pc += 2
+				var b strings.Builder
+				flatten(&b, m.popToMark())
+				m.push(&Node{Kind: kind, Lexeme: b.String(), sealed: true})
 				goto loop
 			case opFork:
 				// m takes the preferred path; the fork takes the other and shares
