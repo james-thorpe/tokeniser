@@ -18,6 +18,7 @@ const (
 	opMark
 	opSeq
 	opFork
+	opJmp
 	opEof
 )
 
@@ -32,34 +33,34 @@ type node struct {
 	kind     string
 	children []*node
 	lexeme   string
-	next     *node // stack link
+	nos      *node // next on stack
 }
 
-// stack is the top of a linked list of nodes. Popping never clears next, so
-// stack tails remain immutable and can be shared between machines.
+// tos is the top of a linked list of nodes. Popping never clears next, so
+// tos tails remain immutable and can be shared between machines.
 type machine struct {
 	parent *machine
 	next   *machine
 	pc     int32
-	stack  *node
+	tos    *node // top of stack
 }
 
 func (m *machine) push(s *node) {
-	s.next = m.stack
-	m.stack = s
+	s.nos = m.tos
+	m.tos = s
 }
 
 func (m *machine) pop() (tos *node) {
-	tos = m.stack
-	m.stack = tos.next
+	tos = m.tos
+	m.tos = tos.nos
 	return
 }
 
-// pushChar extends a chars node on top of the stack, or pushes a new one. The
-// top node is replaced rather than modified because forks share stack nodes.
+// pushChar extends a chars node on top of the tos, or pushes a new one. The
+// top node is replaced rather than modified because forks share tos nodes.
 func (m *machine) pushChar(r rune) {
 	lexeme := string(r)
-	if m.stack != nil && m.stack.kind == nkChars {
+	if m.tos != nil && m.tos.kind == nkChars {
 		lexeme = m.pop().lexeme + lexeme
 	}
 	m.push(&node{kind: nkChars, lexeme: lexeme})
@@ -80,11 +81,11 @@ func (m *machine) popToMark() (tos []*node) {
 // ZeroOrMore can leave zero or several nodes: none yields nil, a single node
 // is returned as is, and several are wrapped in a seq node in push order.
 func (m *machine) result() *node {
-	if m.stack == nil || m.stack.next == nil {
-		return m.stack
+	if m.tos == nil || m.tos.nos == nil {
+		return m.tos
 	}
 	var children []*node
-	for m.stack != nil {
+	for m.tos != nil {
 		children = append(children, m.pop())
 	}
 	slices.Reverse(children)
@@ -183,6 +184,31 @@ func OneOrMore(first any, rest ...any) Compiler {
 	}
 }
 
+// Choice matches exactly one of its alternatives, preferring earlier ones when
+// several succeed. Each alternative is a single element; use Seq to group
+// several. Like Optional it adds no node of its own. Each alternative but the
+// last is preceded by a fork to the next and followed by a jump past the rest.
+func Choice(first any, rest ...any) Compiler {
+	alts := append([]Compiler{convertToCompiler(first)}, convertToCompilers(rest)...)
+	return func(p *program) {
+		last := len(alts) - 1
+		jumps := make([]int, 0, last)
+		for _, alt := range alts[:last] {
+			fork := len(*p)
+			op(p, opFork, 0)
+			alt(p)
+			jumps = append(jumps, len(*p))
+			op(p, opJmp, 0)
+			(*p)[fork+1] = int32(len(*p))
+		}
+		alts[last](p)
+		// The end is only known once every alternative has been emitted.
+		for _, jmp := range jumps {
+			(*p)[jmp+1] = int32(len(*p))
+		}
+	}
+}
+
 func emit(p *program, first Compiler, rest []Compiler) {
 	first(p)
 	for _, compiler := range rest {
@@ -277,8 +303,11 @@ func Run(c Compiler, runes []rune) (*node, error) {
 				if target < m.pc {
 					target, next = next, target
 				}
-				running = &machine{pc: target, stack: m.stack, next: running}
+				running = &machine{pc: target, tos: m.tos, next: running}
 				m.pc = next
+				goto loop
+			case opJmp:
+				m.pc = prog[m.pc+1]
 				goto loop
 			case opEof:
 				if r == -1 {

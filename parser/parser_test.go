@@ -687,6 +687,128 @@ func Test_OneOrMorePanics(t *testing.T) {
 	}
 }
 
+// Each alternative but the last forks to the next and jumps to the end.
+func Test_ChoiceCompile(t *testing.T) {
+	compiles(t, Choice('a'), opChar, 'a', 'a')
+	compiles(t, Choice('a', 'b'),
+		opFork, 7,
+		opChar, 'a', 'a',
+		opJmp, 10,
+		opChar, 'b', 'b')
+	compiles(t, Choice('a', 'b', 'c'),
+		opFork, 7,
+		opChar, 'a', 'a',
+		opJmp, 17,
+		opFork, 14,
+		opChar, 'b', 'b',
+		opJmp, 17,
+		opChar, 'c', 'c')
+}
+
+func Test_Choice(t *testing.T) {
+	c := Choice('a', "bc", Range('0', '9'))
+	match(t, "a", c, "a")
+	match(t, "bc", c, "bc")
+	match(t, "7", c, "7")
+
+	noMatch(t, "", c, ErrUnexpectedEOI)
+	noMatch(t, "x", c, ErrGrammarMismatch)
+	noMatch(t, "b", c, ErrUnexpectedEOI)
+	noMatch(t, "ab", c, ErrGrammarMismatch)
+}
+
+// Like Optional, a Choice adds no node; the chosen alternative's nodes join
+// the enclosing sequence.
+func Test_ChoiceInSeq(t *testing.T) {
+	c := Seq('x', Choice('a', Seq('b')), 'y')
+	match(t, "xay", c, "(xay)")
+	match(t, "xby", c, "(x (b) y)")
+
+	noMatch(t, "xy", c, ErrGrammarMismatch)
+	noMatch(t, "xcy", c, ErrGrammarMismatch)
+	noMatch(t, "xaby", c, ErrGrammarMismatch)
+}
+
+// When several alternatives match, the earliest wins.
+func Test_ChoicePriority(t *testing.T) {
+	match(t, "a", Choice(Seq('a'), 'a'), "(a)")
+	match(t, "a", Choice('a', Seq('a')), "a")
+	match(t, "a", Choice('b', Seq('a'), 'a'), "(a)")
+}
+
+// Alternatives that consume different lengths run in parallel; the one that
+// fits the rest of the input succeeds.
+func Test_ChoiceDifferentLengths(t *testing.T) {
+	c := Seq(Choice(Seq("ab"), 'a'), 'b')
+	match(t, "ab", c, "(ab)")
+	match(t, "abb", c, "((ab) b)")
+
+	c = Seq(Choice('a', Seq("ab")), 'c')
+	match(t, "ac", c, "(ac)")
+	match(t, "abc", c, "((ab) c)")
+}
+
+func Test_ChoiceNested(t *testing.T) {
+	c := Choice(Choice('a', 'b'), Seq(Choice('c', 'd')))
+	match(t, "a", c, "a")
+	match(t, "b", c, "b")
+	match(t, "d", c, "(d)")
+	noMatch(t, "e", c, ErrGrammarMismatch)
+}
+
+// An alternative that can match empty input makes the Choice optional.
+func Test_ChoiceNullable(t *testing.T) {
+	c := Seq('x', Choice('a', Optional(Seq('b'))), 'y')
+	match(t, "xy", c, "(xy)")
+	match(t, "xay", c, "(xay)")
+	match(t, "xby", c, "(x (b) y)")
+}
+
+func Test_ChoiceInRepetition(t *testing.T) {
+	match(t, "aba", ZeroOrMore(Choice('a', Seq('b'))), "(a (b) a)")
+	match(t, "abba", OneOrMore(Choice("ab", "ba")), "abba")
+	noMatch(t, "abb", OneOrMore(Choice("ab", "ba")), ErrUnexpectedEOI)
+}
+
+func Test_ChoiceErrorOffset(t *testing.T) {
+	_, err := run(t, "xcy", Seq('x', Choice('a', 'b'), 'y'))
+	want := `grammar mismatch: unexpected 'c' at offset 1`
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v, want %q", err, want)
+	}
+}
+
+func Test_ChoicePanics(t *testing.T) {
+	cases := []struct {
+		name  string
+		first any
+		rest  []any
+		want  error
+	}{
+		{"empty text", "", nil, ErrEmptyText},
+		{"empty text rest", 'a', []any{""}, ErrEmptyText},
+		{"unsupported", 1, nil, nil},
+		{"unsupported rest", 'a', []any{1}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("no panic")
+				}
+				if tc.want == nil {
+					return
+				}
+				if err, ok := r.(error); !ok || !errors.Is(err, tc.want) {
+					t.Errorf("recovered %v, want %v", r, tc.want)
+				}
+			}()
+			Choice(tc.first, tc.rest...)
+		})
+	}
+}
+
 // Top-level Optional and ZeroOrMore can leave several nodes at end of input;
 // opEof wraps them in a seq node rather than returning only the last.
 func Test_EofMultipleNodes(t *testing.T) {
@@ -772,8 +894,8 @@ func Test_MachineStack(t *testing.T) {
 			t.Fatalf("pop = %v, want %v", got, want)
 		}
 	}
-	if m.stack != nil {
-		t.Fatalf("stack = %v, want empty", m.stack)
+	if m.tos != nil {
+		t.Fatalf("stack = %v, want empty", m.tos)
 	}
 }
 
@@ -782,17 +904,17 @@ func Test_MachinePushChar(t *testing.T) {
 	m := &machine{}
 	m.pushChar('a')
 	m.pushChar('😀')
-	if m.stack.kind != nkChars || m.stack.lexeme != "a😀" {
-		t.Fatalf("top = %q %q, want chars \"a😀\"", m.stack.kind, m.stack.lexeme)
+	if m.tos.kind != nkChars || m.tos.lexeme != "a😀" {
+		t.Fatalf("top = %q %q, want chars \"a😀\"", m.tos.kind, m.tos.lexeme)
 	}
-	if m.stack.next != nil {
-		t.Fatalf("joined chars left %v below", m.stack.next)
+	if m.tos.nos != nil {
+		t.Fatalf("joined chars left %v below", m.tos.nos)
 	}
 
 	m.push(&node{kind: nkMark})
 	m.pushChar('b')
-	if m.stack.lexeme != "b" || m.stack.next.kind != nkMark {
-		t.Fatalf("char after mark joined across it: top = %q", m.stack.lexeme)
+	if m.tos.lexeme != "b" || m.tos.nos.kind != nkMark {
+		t.Fatalf("char after mark joined across it: top = %q", m.tos.lexeme)
 	}
 }
 
@@ -801,16 +923,16 @@ func Test_MachinePushChar(t *testing.T) {
 func Test_MachinePushCharShared(t *testing.T) {
 	m1 := &machine{}
 	m1.pushChar('a')
-	m2 := &machine{stack: m1.stack}
+	m2 := &machine{tos: m1.tos}
 
 	m1.pushChar('b')
 	m2.pushChar('c')
 
-	if m1.stack.lexeme != "ab" {
-		t.Errorf("m1 top = %q, want \"ab\"", m1.stack.lexeme)
+	if m1.tos.lexeme != "ab" {
+		t.Errorf("m1 top = %q, want \"ab\"", m1.tos.lexeme)
 	}
-	if m2.stack.lexeme != "ac" {
-		t.Errorf("m2 top = %q, want \"ac\"", m2.stack.lexeme)
+	if m2.tos.lexeme != "ac" {
+		t.Errorf("m2 top = %q, want \"ac\"", m2.tos.lexeme)
 	}
 }
 
@@ -850,14 +972,14 @@ func Test_MachinePopToMark(t *testing.T) {
 	if got := m.popToMark(); !slices.Equal(got, []*node{a, b}) {
 		t.Fatalf("popToMark = %v, want [a b] in push order", got)
 	}
-	if m.stack != x {
-		t.Fatalf("top = %v, want x", m.stack)
+	if m.tos != x {
+		t.Fatalf("top = %v, want x", m.tos)
 	}
 	if got := m.popToMark(); !slices.Equal(got, []*node{x}) {
 		t.Fatalf("popToMark = %v, want [x]", got)
 	}
-	if m.stack != nil {
-		t.Fatalf("stack = %v, want empty", m.stack)
+	if m.tos != nil {
+		t.Fatalf("stack = %v, want empty", m.tos)
 	}
 }
 
@@ -871,8 +993,8 @@ func Test_MachinePopToMarkEmpty(t *testing.T) {
 	if got := m.popToMark(); len(got) != 0 {
 		t.Fatalf("popToMark = %v, want empty", got)
 	}
-	if m.stack != below {
-		t.Fatalf("top = %v, want below", m.stack)
+	if m.tos != below {
+		t.Fatalf("top = %v, want below", m.tos)
 	}
 }
 
@@ -905,7 +1027,7 @@ func Test_MachineSharedTail(t *testing.T) {
 	m1 := &machine{}
 	m1.push(a)
 	m1.push(b)
-	m2 := &machine{stack: m1.stack}
+	m2 := &machine{tos: m1.tos}
 
 	if got := m2.pop(); got != b {
 		t.Fatalf("m2 pop = %v, want b", got)

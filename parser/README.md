@@ -21,10 +21,15 @@ parenthesised, space-separated list of children.
 | `Optional`               | Its elements' nodes when matched, nothing when skipped.      |
 | `ZeroOrMore`             | Its elements' nodes once per iteration, nothing for zero.    |
 | `OneOrMore`              | Its elements' nodes once per iteration; at least one.        |
+| `Choice`                 | The chosen alternative's nodes.                              |
 
-`Optional`, `ZeroOrMore` and `OneOrMore` never add a node of their own. Their
-elements' nodes become children of the enclosing `Seq`; wrap the elements in a
-`Seq` to keep them grouped.
+`Optional`, `ZeroOrMore`, `OneOrMore` and `Choice` never add a node of their
+own. Their elements' nodes become children of the enclosing `Seq`; wrap the
+elements in a `Seq` to keep them grouped.
+
+`Optional`, `ZeroOrMore` and `OneOrMore` treat multiple arguments as a group
+that matches together. `Choice` treats each argument as a separate
+alternative; group an alternative of several elements with `Seq`.
 
 | Grammar                                  | Input  | Tree            |
 |------------------------------------------|--------|-----------------|
@@ -32,6 +37,7 @@ elements' nodes become children of the enclosing `Seq`; wrap the elements in a
 | `Seq('x', ZeroOrMore(Seq('a')), 'y')`    | `xaay` | `(x (a) (a) y)` |
 | `Seq('x', Optional('a', Seq('b')), 'y')` | `xaby` | `(xa (b) y)`    |
 | `Seq(Optional('a'))`                     | (empty)| `()`            |
+| `Seq('x', Choice('a', Seq('b')), 'y')`   | `xby`  | `(x (b) y)`     |
 
 ### Character merging
 
@@ -59,7 +65,8 @@ left on the stack:
 | several    | a new seq node holding them in match order         |
 
 Only a top-level `Optional` or `ZeroOrMore` can leave no nodes, and only
-those and `OneOrMore` can leave several.
+those and `OneOrMore` can leave several. A top-level `Choice` leaves whatever
+its chosen alternative does.
 
 | Grammar                   | Input  | Root        |
 |---------------------------|--------|-------------|
@@ -81,10 +88,22 @@ does not vary.
 the input succeed, the one that matches elements earlier and more often is
 returned.
 
-| Grammar                                  | Input | Tree        |
-|------------------------------------------|-------|-------------|
+| Grammar                                    | Input | Tree        |
+|--------------------------------------------|-------|-------------|
 | `Seq(ZeroOrMore(Seq('a')), Optional('a'))` | `aa`  | `((a) (a))` |
-| `Seq(Optional(Seq('a')), 'a')`           | `aa`  | `((a) a)`   |
+| `Seq(Optional(Seq('a')), 'a')`             | `aa`  | `((a) a)`   |
+
+`Choice` is ordered: when several alternatives lead to a successful parse, the
+earliest is returned. Alternatives run in parallel, so one that matches a
+longer prefix does not prevent a later one from succeeding if the longer match
+cannot complete.
+
+| Grammar                          | Input | Tree       |
+|----------------------------------|-------|------------|
+| `Choice(Seq('a'), 'a')`          | `a`   | `(a)`      |
+| `Choice('a', Seq('a'))`          | `a`   | `a`        |
+| `Seq(Choice(Seq("ab"), 'a'), 'b')` | `ab`  | `(ab)`     |
+| `Seq(Choice(Seq("ab"), 'a'), 'b')` | `abb` | `((ab) b)` |
 
 ## Errors
 
