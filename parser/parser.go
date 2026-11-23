@@ -22,6 +22,8 @@ const (
 	opRule
 	opFork
 	opJmp
+	opCall
+	opRet
 	opEof
 )
 
@@ -351,15 +353,23 @@ func Run(c Compiler, runes []rune) (*Node, error) {
 				// machines. Falling through is preferred, except on a backward
 				// fork (a loop back-edge), where staying in the loop is preferred
 				// so repetition is greedy.
-				target, next := prog[m.pc+1], m.pc+2
+				target, next := prog[m.pc+1], m.pc+2 // swap this for greedy match
 				if target < m.pc {
 					target, next = next, target
 				}
-				running = &machine{pc: target, tos: m.tos, next: running}
+				running = &machine{pc: target, tos: m.tos, next: running, parent: m.parent}
 				m.pc = next
 				goto loop
 			case opJmp:
 				m.pc = prog[m.pc+1]
+				goto loop
+			case opCall:
+				// Frames are immutable so forks inside the callee can share them.
+				m.parent = &machine{pc: m.pc + 2, parent: m.parent}
+				m.pc = prog[m.pc+1] // use current machine for the callee
+				goto loop
+			case opRet:
+				m.pc, m.parent = m.parent.pc, m.parent.parent
 				goto loop
 			case opEof:
 				if r == -1 {

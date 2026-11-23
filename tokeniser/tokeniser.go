@@ -3,18 +3,18 @@ package tokeniser
 import (
 	"errors"
 	"slices"
-	"strings"
+	"unicode/utf8"
 )
 
 // Matcher returns true to indicate that a transition is valid for the rune r
 type Matcher func(r rune) bool
 
 type State struct {
-	id          int      // id of state (used to debug and graph state machine)
-	description string   // text description of matcher (used to debug and graph state machine)
-	nextStates  []*State // possible outbound state nextStates
-	match       Matcher  // if true the state machine can transition to this state
-	pos         int      // track pos of state in input stream
+	id         int      // id of state (used to debug and graph state machine)
+	nextStates []*State // possible outbound state nextStates
+	runeLow    rune
+	runeHigh   rune
+	pos        int // track pos of state in input stream
 }
 
 type States = []*State
@@ -29,14 +29,14 @@ type Metadata struct {
 var ErrUnexpectedEOI = errors.New("unexpected end of input")
 var ErrGrammarMismatch = errors.New("input does not match grammar")
 
-func Match(matcher Matcher, description string) Compiler {
+func Match(runeLow rune, runeHigh rune) Compiler {
 	return func(meta *Metadata, prevTail States) States {
 		state := &State{
-			match:       matcher,
-			nextStates:  States{},
-			id:          len(meta.states),
-			description: description,
-			pos:         -1}
+			nextStates: States{},
+			id:         len(meta.states),
+			runeLow:    runeLow,
+			runeHigh:   runeHigh,
+			pos:        -1}
 		states := States{state}
 		// connect previous states to this state
 		connect(prevTail, states)
@@ -48,7 +48,7 @@ func Match(matcher Matcher, description string) Compiler {
 
 // MatchRune matches an input rune
 func MatchRune(rn rune) Compiler {
-	return Match(func(r rune) bool { return r == rn }, string(rn))
+	return Match(rn, rn)
 }
 
 func MatchString(text string) Compiler {
@@ -62,17 +62,12 @@ func MatchString(text string) Compiler {
 
 // Any matches any rune (always returns true)
 func Any() Compiler {
-	return Match(func(r rune) bool { return true }, "∀")
-}
-
-// OneOf returns true if an input rune is found in a string
-func OneOf(options string) Compiler {
-	return Match(func(r rune) bool { return strings.ContainsRune(options, r) }, options)
+	return Match(rune(0), utf8.MaxRune)
 }
 
 // Range returns true if an input rune is between low and high inclusive
 func Range(low, high rune) Compiler {
-	return Match(func(r rune) bool { return r >= low && r <= high }, string(low)+"-"+string(high))
+	return Match(low, high)
 }
 
 func Seq(compilers ...any) Compiler {
@@ -149,6 +144,14 @@ func compile(compiler Compiler) (start *State, end *State, meta *Metadata) {
 	return meta.states[0], tail[0], meta //
 }
 
+// calculate the intersecting char matches for each state and create a shared state containing the overlap
+// eg Alt("ab", "ac") -> Seq("a", Alt("b", "c")
+func nfaToDfa(meta *Metadata) {
+	for i := 0; i < len(meta.states); i++ {
+
+	}
+}
+
 func Run(compiler Compiler, input []rune) (err error) {
 	start, end, _ := compile(compiler)
 	input = append(input, rune(-1))  // Add terminal to input. Don't do this in production. Inefficient!
@@ -162,7 +165,7 @@ func Run(compiler Compiler, input []rune) (err error) {
 			for _, nextState := range state.nextStates {
 				// if nextState is at this position then it is already pending so we can skip it
 				// otherwise if NextState matches input add to pending
-				if nextState.pos != pos && nextState.match(r) {
+				if nextState.pos != pos && (r >= nextState.runeLow && r <= nextState.runeHigh) {
 					nextState.pos = pos
 					// if nextState == end then we must also be at the end of the input (r == -1)
 					// so we are all done.

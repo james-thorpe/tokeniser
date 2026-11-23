@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func Test_MatchNoInput(t *testing.T) {
@@ -34,6 +35,33 @@ func Test_String(t *testing.T) {
 	test(t, "ab", MatchString("ab"))
 	testE(t, "abc", MatchString("ab"), ErrGrammarMismatch)
 	testE(t, "a", MatchString("ab"), ErrUnexpectedEOI)
+}
+
+func Test_StringMultiByte(t *testing.T) {
+	test(t, "héllo", MatchString("héllo"))
+	test(t, "日本", MatchString("日本"))
+	testE(t, "日", MatchString("日本"), ErrUnexpectedEOI)
+	testE(t, "日日", MatchString("日本"), ErrGrammarMismatch)
+}
+
+func Test_Range(t *testing.T) {
+	test(t, "a", Range('a', 'c'))
+	test(t, "b", Range('a', 'c'))
+	test(t, "c", Range('a', 'c')) // bounds are inclusive
+	testE(t, "`", Range('a', 'c'), ErrGrammarMismatch)
+	testE(t, "d", Range('a', 'c'), ErrGrammarMismatch)
+	test(t, "x", Range('x', 'x')) // single rune range
+	testE(t, "", Range('a', 'c'), ErrUnexpectedEOI)
+}
+
+func Test_Any(t *testing.T) {
+	test(t, "a", Any())
+	test(t, "\x00", Any())
+	test(t, string(utf8.MaxRune), Any())
+	test(t, "日", Any())
+	testE(t, "", Any(), ErrUnexpectedEOI)
+	testE(t, "ab", Any(), ErrGrammarMismatch)
+	test(t, "abc", Seq('a', Any(), 'c'))
 }
 
 func Test_Optional(t *testing.T) {
@@ -141,6 +169,18 @@ func testE(t *testing.T, input string, exp Compiler, expectedErr error) {
 	}
 }
 
+// label renders a state's rune range for graph transitions
+func label(s *State) string {
+	switch {
+	case s.runeLow == 0 && s.runeHigh == utf8.MaxRune:
+		return "∀"
+	case s.runeLow == s.runeHigh:
+		return string(s.runeLow)
+	default:
+		return string(s.runeLow) + "-" + string(s.runeHigh)
+	}
+}
+
 func graph(exp Compiler) {
 	var builder strings.Builder
 	Graph(&builder, exp)
@@ -166,7 +206,7 @@ func Graph(writer io.Writer, compiler Compiler) {
 			if transition == end {
 				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"δ\"];\n", state.id, transition.id)
 			} else {
-				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, transition.id, transition.description)
+				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, transition.id, label(transition))
 			}
 
 		}
