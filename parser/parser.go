@@ -19,6 +19,7 @@ const (
 	opMark
 	opSeq
 	opToken
+	opRule
 	opFork
 	opJmp
 	opEof
@@ -37,7 +38,7 @@ type Node struct {
 	Children []*Node
 	Lexeme   string
 	nos      *Node // next on stack
-	sealed   bool  // set on Token nodes so later chars start a new node
+	sealed   bool  // set on Token and Rule nodes so later chars start a new node
 }
 
 // tos is the top of a linked list of nodes. Popping never clears next, so
@@ -140,6 +141,19 @@ func Seq(first any, rest ...any) Compiler {
 			compiler(p)
 		}
 		op(p, opSeq)
+	}
+}
+
+// Rule matches its elements like Seq and leaves one interior node of the given
+// kind holding their nodes. The node is sealed so that, when kind is NkChars,
+// characters matched after it start a new node instead of replacing it.
+func Rule(kind int32, first any, rest ...any) Compiler {
+	convertedFirst := convertToCompiler(first)
+	convertedRest := convertToCompilers(rest)
+	return func(p *program) {
+		op(p, opMark)
+		emit(p, convertedFirst, convertedRest)
+		op(p, opRule, kind)
 	}
 }
 
@@ -324,6 +338,11 @@ func Run(c Compiler, runes []rune) (*Node, error) {
 				var b strings.Builder
 				flatten(&b, m.popToMark())
 				m.push(&Node{Kind: kind, Lexeme: b.String(), sealed: true})
+				goto loop
+			case opRule:
+				kind := prog[m.pc+1]
+				m.pc += 2
+				m.push(&Node{Kind: kind, Children: m.popToMark(), sealed: true})
 				goto loop
 			case opFork:
 				// m takes the preferred path; the fork takes the other and shares

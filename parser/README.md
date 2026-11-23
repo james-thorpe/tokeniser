@@ -3,7 +3,7 @@
 ## Result tree
 
 `Run` returns a tree of `*Node` values. The parser produces two kinds itself;
-`Token` produces leaves of a caller-supplied kind:
+`Token` and `Rule` produce leaf and interior nodes of a caller-supplied kind:
 
 | Kind      | Meaning                                             |
 |-----------|-----------------------------------------------------|
@@ -13,8 +13,8 @@
 Kinds are `int32`. The parser's own kinds are negative; zero and positive
 values are reserved for user-defined kinds.
 
-The examples below render leaf nodes as their lexeme and seq nodes as a
-parenthesised, space-separated list of children. `K` stands for any kind.
+The examples below render leaf nodes as their lexeme and seq and rule nodes as
+a parenthesised, space-separated list of children. `K` stands for any kind.
 
 ### Nodes contributed by each element
 
@@ -22,6 +22,7 @@ parenthesised, space-separated list of children. `K` stands for any kind.
 |--------------------------|--------------------------------------------------------------|
 | `Char`, `Range`, `Text`  | Characters, merged into the adjacent chars node (see below). |
 | `Seq`                    | Exactly one seq node holding its elements' nodes.            |
+| `Rule`                   | Exactly one node of the given kind holding its elements' nodes. |
 | `Token`                  | Exactly one leaf of the given kind holding every character matched within. |
 | `Optional`               | Its elements' nodes when matched, nothing when skipped.      |
 | `ZeroOrMore`             | Its elements' nodes once per iteration, nothing for zero.    |
@@ -49,7 +50,7 @@ alternative; group an alternative of several elements with `Seq`.
 A matched character is appended to the chars node on top of the stack if
 there is one; otherwise a new chars node is pushed. Adjacent characters
 therefore form a single leaf regardless of which elements matched them. Only a
-`Seq` or `Token` boundary separates them.
+`Seq`, `Rule` or `Token` boundary separates them.
 
 | Grammar                         | Input   | Tree        |
 |---------------------------------|---------|-------------|
@@ -64,7 +65,7 @@ therefore form a single leaf regardless of which elements matched them. Only a
 `Token(kind, ...)` matches its elements as `Seq` does, then replaces
 everything they produced with a single leaf node of `kind`. Its lexeme is the
 concatenation, in match order, of every character matched beneath it, however
-deeply nested in `Seq` or `Token` nodes. A token that matches nothing yields a
+deeply nested in `Seq`, `Rule` or `Token` nodes. A token that matches nothing yields a
 node with an empty lexeme.
 
 A token node is sealed: characters matched after it start a new chars node
@@ -76,6 +77,21 @@ when `kind` is `NkChars`.
 | `Token(K, 'a', Seq('b'), 'c')`                  | `abc`  | `abc`      |
 | `Seq('x', Token(K, Seq('a'), Seq('b')), 'y')`   | `xaby` | `(x ab y)` |
 | `Seq(Token(K, 'a'), Token(K, 'b'))`             | `ab`   | `(a b)`    |
+
+### Rules
+
+`Rule(kind, ...)` is a `Seq` whose node has `kind` instead of `NkSeq`. It
+holds its elements' nodes as `Children` and has an empty lexeme. A rule that
+matches nothing yields a node of `kind` with no children.
+
+Like a token node, a rule node is sealed, so characters matched after it start
+a new chars node even when `kind` is `NkChars`.
+
+| Grammar                                   | Input   | Tree           |
+|-------------------------------------------|---------|----------------|
+| `Rule(K, '1', '+', '2')`                  | `1+2`   | `(1+2)`        |
+| `Rule(K, Token(K, "12"), '+', Token(K, "34"))` | `12+34` | `(12 + 34)` |
+| `Seq('x', Rule(K, '1'), 'y')`             | `x1y`   | `(x (1) y)`    |
 
 ### Root
 

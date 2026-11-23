@@ -3,6 +3,7 @@ package parser
 import (
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -147,6 +148,7 @@ func Test_NodeKinds(t *testing.T) {
 		{"optional present", "a", Optional('a'), NkChars},
 		{"seq of skipped optional", "", Seq(Optional('a')), NkSeq},
 		{"token", "ab", Token(nkWord, 'a', Seq('b')), nkWord},
+		{"rule", "ab", Rule(nkSum, 'a', Seq('b')), nkSum},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -810,12 +812,163 @@ func Test_ChoicePanics(t *testing.T) {
 	}
 }
 
-// User-defined kinds for Token tests.
+// User-defined kinds for Token and Rule tests.
 const (
 	nkWord int32 = iota
 	nkInteger
 	nkNumber
+	nkSum
+	nkTerm
+	nkExpr
 )
+
+// Rule brackets its elements like Seq but closes with opRule and its kind.
+func Test_RuleCompile(t *testing.T) {
+	compiles(t, Rule(nkSum, Char('1')), opMark, opChar, '1', '1', opRule, nkSum)
+	compiles(t, Rule(nkSum, Seq(Char('1')), Char('+')),
+		opMark,
+		opMark,
+		opChar, '1', '1',
+		opSeq,
+		opChar, '+', '+',
+		opRule, nkSum)
+}
+
+func Test_Rule(t *testing.T) {
+	digit := Range('0', '9')
+	integer := Token(nkInteger, OneOrMore(digit))
+
+	match(t, "1+2", Rule(nkSum, digit, '+', digit), "(1+2)")
+	match(t, "12+34", Rule(nkSum, integer, '+', integer), "(12 + 34)")
+	match(t, "1+2+3", Rule(nkSum, integer, OneOrMore('+', integer)), "(1 + 2 + 3)")
+	match(t, "x1+2y", Seq('x', Rule(nkSum, digit, '+', digit), 'y'), "(x (1+2) y)")
+
+	noMatch(t, "1+", Rule(nkSum, digit, '+', digit), ErrUnexpectedEOI)
+	noMatch(t, "1-2", Rule(nkSum, digit, '+', digit), ErrGrammarMismatch)
+}
+
+func Test_RuleNodeShape(t *testing.T) {
+	integer := Token(nkInteger, OneOrMore(Range('0', '9')))
+	n, err := run(t, "12+34", Rule(nkSum, integer, '+', integer))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n.Kind != nkSum || n.Lexeme != "" {
+		t.Fatalf("rule = %d %q, want sum with empty lexeme", n.Kind, n.Lexeme)
+	}
+	wantKinds := []int32{nkInteger, NkChars, nkInteger}
+	if len(n.Children) != len(wantKinds) {
+		t.Fatalf("children = %d, want %d", len(n.Children), len(wantKinds))
+	}
+	for i, c := range n.Children {
+		if c.Kind != wantKinds[i] {
+			t.Errorf("child %d kind = %d, want %d", i, c.Kind, wantKinds[i])
+		}
+	}
+}
+
+// A rule node is sealed: with kind NkChars, a following character would
+// otherwise replace the rule node and drop its children.
+func Test_RuleBoundary(t *testing.T) {
+	match(t, "12", Seq(Rule(NkChars, '1'), '2'), "((1) 2)")
+	match(t, "12", Seq(Rule(nkSum, '1'), Rule(nkSum, '2')), "((1) (2))")
+}
+
+// Token flattens a rule beneath it like any other interior node.
+func Test_RuleInToken(t *testing.T) {
+	match(t, "a+b", Token(nkWord, Rule(nkSum, 'a', Seq('+'), 'b')), "a+b")
+}
+
+// A rule that matches nothing still leaves a node, as an empty Seq does.
+func Test_RuleEmpty(t *testing.T) {
+	n, err := run(t, "", Rule(nkSum, Optional('a')))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n == nil || n.Kind != nkSum || len(n.Children) != 0 {
+		t.Errorf("rule = %v, want empty sum node", n)
+	}
+}
+
+// Precedence comes from nesting: an expr is terms joined by + or -, and a term
+// is integers joined by * or /, so * and / bind tighter. Repetition within each
+// rule keeps operands in order, making evaluation left-associative.
+func Test_Calculator(t *testing.T) {
+	integer := Token(nkInteger, OneOrMore(Range('0', '9')))
+	term := Rule(nkTerm, integer, ZeroOrMore(Choice('*', '/'), integer))
+	expr := Rule(nkExpr, term, ZeroOrMore(Choice('+', '-'), term))
+
+	cases := []struct {
+		input string
+		tree  string
+		value float64
+	}{
+		{"7", "((7))", 7},
+		{"1+2", "((1) + (2))", 3},
+		{"2*3", "((2 * 3))", 6},
+		{"2+3*4", "((2) + (3 * 4))", 14},
+		{"2*3+4", "((2 * 3) + (4))", 10},
+		{"10-4-3", "((10) - (4) - (3))", 3},
+		{"8/4/2", "((8 / 4 / 2))", 1},
+		{"1+2*3-8/4", "((1) + (2 * 3) - (8 / 4))", 5},
+		{"12*3/4+5-6*2", "((12 * 3 / 4) + (5) - (6 * 2))", 2},
+		{"7/2", "((7 / 2))", 3.5},
+	}
+	for _, tc := range cases {
+		match(t, tc.input, expr, tc.tree)
+		n, err := run(t, tc.input, expr)
+		if err != nil {
+			continue
+		}
+		if got := calculate(t, n); got != tc.value {
+			t.Errorf("%q: value = %v, want %v", tc.input, got, tc.value)
+		}
+	}
+
+	noMatch(t, "", expr, ErrUnexpectedEOI)
+	noMatch(t, "1+", expr, ErrUnexpectedEOI)
+	noMatch(t, "2*", expr, ErrUnexpectedEOI)
+	noMatch(t, "+1", expr, ErrGrammarMismatch)
+	noMatch(t, "1++2", expr, ErrGrammarMismatch)
+	noMatch(t, "1*/2", expr, ErrGrammarMismatch)
+	noMatch(t, "1 + 2", expr, ErrGrammarMismatch)
+}
+
+// Children of an expr or term alternate operand, operator, operand, ...
+func calculate(t *testing.T, n *Node) float64 {
+	t.Helper()
+	if n.Kind == nkInteger {
+		v, err := strconv.ParseFloat(n.Lexeme, 64)
+		if err != nil {
+			t.Fatalf("integer %q: %v", n.Lexeme, err)
+		}
+		return v
+	}
+	if n.Kind != nkExpr && n.Kind != nkTerm {
+		t.Fatalf("unexpected node kind %d", n.Kind)
+	}
+	result := calculate(t, n.Children[0])
+	for i := 1; i+1 < len(n.Children); i += 2 {
+		result = apply(t, n.Children[i].Lexeme, result, calculate(t, n.Children[i+1]))
+	}
+	return result
+}
+
+func apply(t *testing.T, op string, a, b float64) float64 {
+	t.Helper()
+	switch op {
+	case "+":
+		return a + b
+	case "-":
+		return a - b
+	case "*":
+		return a * b
+	case "/":
+		return a / b
+	}
+	t.Fatalf("unexpected operator %q", op)
+	return 0
+}
 
 // Token brackets its elements like Seq but closes with opToken and its kind.
 func Test_TokenCompile(t *testing.T) {
@@ -1232,10 +1385,11 @@ func run(t *testing.T, s string, c Compiler) (got *Node, err error) {
 	return Run(c, []rune(s))
 }
 
-// Renders chars nodes as their lexeme and sequence nodes as a parenthesised
-// list. Keyed on kind because an empty sequence has nil children.
+// Renders leaf nodes as their lexeme and interior nodes as a parenthesised
+// list. Seq is keyed on kind because an empty sequence has nil children; an
+// empty Rule is indistinguishable from an empty leaf and renders as "".
 func show(s *Node) string {
-	if s.Kind != NkSeq {
+	if s.Kind != NkSeq && s.Children == nil {
 		return s.Lexeme
 	}
 	parts := make([]string, len(s.Children))
