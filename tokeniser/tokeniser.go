@@ -12,8 +12,8 @@ type Matcher func(r rune) bool
 type State struct {
 	id         int      // id of state (used to debug and graph state machine)
 	nextStates []*State // possible outbound state nextStates
-	runeLow    rune
-	runeHigh   rune
+	low        rune
+	high       rune
 	pos        int // track pos of state in input stream
 }
 
@@ -34,8 +34,8 @@ func Match(runeLow rune, runeHigh rune) Compiler {
 		state := &State{
 			nextStates: States{},
 			id:         len(meta.states),
-			runeLow:    runeLow,
-			runeHigh:   runeHigh,
+			low:        runeLow,
+			high:       runeHigh,
 			pos:        -1}
 		states := States{state}
 		// connect previous states to this state
@@ -144,14 +144,6 @@ func compile(compiler Compiler) (start *State, end *State, meta *Metadata) {
 	return meta.states[0], tail[0], meta //
 }
 
-// calculate the intersecting char matches for each state and create a shared state containing the overlap
-// eg Alt("ab", "ac") -> Seq("a", Alt("b", "c")
-func nfaToDfa(meta *Metadata) {
-	for i := 0; i < len(meta.states); i++ {
-
-	}
-}
-
 func Run(compiler Compiler, input []rune) (err error) {
 	start, end, _ := compile(compiler)
 	input = append(input, rune(-1))  // Add terminal to input. Don't do this in production. Inefficient!
@@ -165,7 +157,7 @@ func Run(compiler Compiler, input []rune) (err error) {
 			for _, nextState := range state.nextStates {
 				// if nextState is at this position then it is already pending so we can skip it
 				// otherwise if NextState matches input add to pending
-				if nextState.pos != pos && (r >= nextState.runeLow && r <= nextState.runeHigh) {
+				if nextState.pos != pos && (r >= nextState.low && r <= nextState.high) {
 					nextState.pos = pos
 					// if nextState == end then we must also be at the end of the input (r == -1)
 					// so we are all done.

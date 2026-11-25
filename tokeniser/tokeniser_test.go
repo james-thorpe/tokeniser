@@ -10,6 +10,14 @@ import (
 	"unicode/utf8"
 )
 
+func Test_Node(t *testing.T) {
+	m := Match('a', 'a')
+	m = MatchString("ab")
+	m = Seq('a', 'b')
+	m = Seq(ZeroOrMore(Alt('a', 'b')), "abb")
+	graph(m)
+}
+
 func Test_MatchNoInput(t *testing.T) {
 	testE(t, "", MatchRune('a'), ErrUnexpectedEOI)
 }
@@ -172,12 +180,12 @@ func testE(t *testing.T, input string, exp Compiler, expectedErr error) {
 // label renders a state's rune range for graph transitions
 func label(s *State) string {
 	switch {
-	case s.runeLow == 0 && s.runeHigh == utf8.MaxRune:
+	case s.low == 0 && s.high == utf8.MaxRune:
 		return "∀"
-	case s.runeLow == s.runeHigh:
-		return string(s.runeLow)
+	case s.low == s.high:
+		return string(s.low)
 	default:
-		return string(s.runeLow) + "-" + string(s.runeHigh)
+		return string(s.low) + "-" + string(s.high)
 	}
 }
 

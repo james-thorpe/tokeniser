@@ -1,0 +1,238 @@
+package dfa
+
+import (
+	"errors"
+	"maps"
+	"slices"
+	"unicode/utf8"
+)
+
+// Matcher returns true to indicate that a transition is valid for the rune r
+type Matcher func(r rune) bool
+
+type State struct {
+	id         int      // id of state (used to debug and graph state machine)
+	nextStates []*State // possible outbound state nextStates
+	low        rune
+	high       rune
+	pos        int // track pos of state in input stream
+}
+
+type States = []*State
+
+type Compiler func(meta *Metadata, prevTail States) States
+
+// Metadata captured during the compilation process. It is used to graph the state machines.
+type Metadata struct {
+	states States // list of all states that have been created (doubles as State.id generator)
+}
+
+var ErrUnexpectedEOI = errors.New("unexpected end of input")
+var ErrGrammarMismatch = errors.New("input does not match grammar")
+
+func Match(runeLow rune, runeHigh rune) Compiler {
+	return func(meta *Metadata, prevTail States) States {
+		state := &State{
+			nextStates: States{},
+			id:         len(meta.states),
+			low:        runeLow,
+			high:       runeHigh,
+			pos:        -1}
+		states := States{state}
+		// connect previous states to this state
+		connect(prevTail, states)
+		// update metadata
+		meta.states = append(meta.states, state)
+		return states
+	}
+}
+
+// MatchRune matches an input rune
+func MatchRune(rn rune) Compiler {
+	return Match(rn, rn)
+}
+
+func MatchString(text string) Compiler {
+	runes := []rune(text)
+	children := make([]any, len(runes))
+	for i, r := range runes {
+		children[i] = MatchRune(r)
+	}
+	return Seq(children...)
+}
+
+// Any matches any rune (always returns true)
+func Any() Compiler {
+	return Match(rune(0), utf8.MaxRune)
+}
+
+// Range returns true if an input rune is between low and high inclusive
+func Range(low, high rune) Compiler {
+	return Match(low, high)
+}
+
+func Seq(compilers ...any) Compiler {
+	return func(meta *Metadata, prevTail States) States {
+		for _, compiler := range compilers {
+			prevTail = convertToCompiler(compiler)(meta, prevTail) // tail = prevTail for each iteration
+		}
+		return prevTail
+	}
+}
+
+func Optional(compilers ...any) Compiler {
+	return func(meta *Metadata, prevTail States) States {
+		tail := Seq(compilers...)(meta, prevTail)
+		return append(prevTail, tail...) // returning prevTail creates a bypass path
+	}
+}
+
+func OneOrMore(compilers ...any) Compiler {
+	return func(meta *Metadata, prevTail States) States {
+		firstHeadIx := len(prevTail[0].nextStates) // identify no. of pre-existing transitions
+		tail := Seq(compilers...)(meta, prevTail)
+		head := prevTail[0].nextStates[firstHeadIx:] // get new transitions as the head of this fragment
+		connect(tail, head)                          // loop back to the head
+		return tail
+	}
+}
+
+func ZeroOrMore(compilers ...any) Compiler {
+	return Optional(OneOrMore(compilers...))
+}
+
+func Alt(alternatives ...any) Compiler {
+	return func(meta *Metadata, prevTail States) States {
+		tail := States{}
+		for _, alt := range alternatives {
+			altTail := convertToCompiler(alt)(meta, prevTail)
+			tail = append(tail, altTail...)
+		}
+		return tail
+	}
+}
+
+func convertToCompiler(obj any) Compiler {
+	switch v := obj.(type) {
+	case Compiler:
+		return v
+	case string:
+		return MatchString(v)
+	case rune:
+		return MatchRune(v)
+	default:
+		panic("unable to convert to compiler") // coding error not runtime error
+	}
+}
+
+// connect each source state to each destination state by adding the destination states
+// to the source state.nextStates slice. We ensure that there are no duplicate states.
+func connect(sourceStates States, destStates States) {
+	for _, source := range sourceStates {
+		for _, dest := range destStates {
+			// add dest to source transitions if not already added
+			if !slices.Contains(source.nextStates, dest) {
+				source.nextStates = append(source.nextStates, dest)
+			}
+		}
+	}
+}
+
+func compile(compiler Compiler) (start *State, end *State, meta *Metadata) {
+	meta = &Metadata{states: States{}}
+	// append a start and end state to the grammar.  This makes Run() simpler
+	tail := Seq(Any(), compiler, rune(-1))(meta, States{})
+	return meta.states[0], tail[0], meta //
+}
+
+// intersection returns the overlapping rune range of a and b, or -1, -1 if they are disjoint.
+func intersection(a, b *State) (low, high rune) {
+	low = max(a.low, b.low)
+	high = min(a.high, b.high)
+	return low, high
+}
+
+// runeRange is an inclusive range of runes low...high
+type runeRange struct {
+	low, high rune
+}
+
+// disjointRanges splits ranges at every boundary so that no two output ranges overlap and each
+// output range lies entirely inside or entirely outside every input range. Gaps not covered by
+// any input are omitted and output is sorted by low.
+// eg [a-m] [k-z] -> [a-j] [k-m] [n-z]
+func disjointRanges(ranges []runeRange) []runeRange {
+	// sweep line: +1 where a range opens, -1 one past where it closes
+	delta := map[rune]int{}
+	for _, r := range ranges {
+		if r.low > r.high {
+			continue
+		}
+		delta[r.low]++
+		delta[r.high+1]--
+	}
+	// boundaries with a net delta of 0 are kept so adjacent inputs (eg [a-c] [d-f]) stay separate
+	bounds := slices.Sorted(maps.Keys(delta))
+	result := []runeRange{}
+	active := 0
+	for i := 0; i < len(bounds)-1; i++ {
+		active += delta[bounds[i]]
+		if active > 0 {
+			result = append(result, runeRange{bounds[i], bounds[i+1] - 1})
+		}
+	}
+	return result
+}
+
+// calculate the intersecting char matches for each state and create a shared state containing the overlap
+// eg Alt("ab", "ac") -> Seq("a", Alt("b", "c")
+func nfaToDfa(meta *Metadata) {
+	// for each state create a disjoint set of next states
+	for i := 0; i < len(meta.states); i++ {
+		state := meta.states[i]
+		if len(state.nextStates) <= 1 {
+			continue
+		}
+
+	}
+}
+
+func Run(compiler Compiler, input []rune) (err error) {
+	start, end, _ := compile(compiler)
+	input = append(input, rune(-1))  // Add terminal to input. Don't do this in production. Inefficient!
+	running := make(States, 0, 8)    // states that are being matched against the current rune
+	pending := make(States, 0, 8)    // states that will be matched against the next rune
+	running = append(running, start) // set start state
+	for pos, r := range input {
+		// for each running state ...
+		for _, state := range running {
+			// transition to nextState if possible
+			for _, nextState := range state.nextStates {
+				// if nextState is at this position then it is already pending so we can skip it
+				// otherwise if NextState matches input add to pending
+				if nextState.pos != pos && (r >= nextState.low && r <= nextState.high) {
+					nextState.pos = pos
+					// if nextState == end then we must also be at the end of the input (r == -1)
+					// so we are all done.
+					if nextState == end {
+						return nil
+					}
+					// add nextState to pending so it becomes a running state for the next rune
+					pending = append(pending, nextState)
+				}
+			}
+		}
+		// if r == -1 then we are at the end of the file but not the end of the grammar
+		if r == -1 {
+			return ErrUnexpectedEOI
+		}
+		// no valid pending states ... so exit with error
+		if len(pending) == 0 {
+			return ErrGrammarMismatch
+		}
+		// swap running and pending states and clear the pending state for next iteration
+		running, pending = pending, running
+		pending = pending[:0]
+	}
+	return nil
+}
