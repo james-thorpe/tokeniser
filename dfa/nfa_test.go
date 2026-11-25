@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -164,6 +165,73 @@ func Test_Float(t *testing.T) {
 	// other invalid input; a sign, hex prefix or BigInt suffix is not part of a decimal literal
 	testE(t, float, ErrGrammarMismatch, "1..5", "1.5.5", "1e+-5", "1e3.5", "e5", "+1", "0x10", "1n")
 	// printGraph(GraphDFA, float)
+}
+
+func Test_DisjointRanges(t *testing.T) {
+	type rr = runeRange
+	cases := []struct {
+		name string
+		in   []rr
+		want []rr
+	}{
+		{"empty", nil, []rr{}},
+		{"single", []rr{{'a', 'z'}}, []rr{{'a', 'z'}}},
+		{"no overlap", []rr{{'x', 'z'}, {'a', 'c'}}, []rr{{'a', 'c'}, {'x', 'z'}}},
+		{"adjacent kept separate", []rr{{'a', 'c'}, {'d', 'f'}}, []rr{{'a', 'c'}, {'d', 'f'}}},
+		{"partial overlap", []rr{{'a', 'm'}, {'k', 'z'}}, []rr{{'a', 'j'}, {'k', 'm'}, {'n', 'z'}}},
+		{"contained", []rr{{'a', 'z'}, {'m', 'p'}}, []rr{{'a', 'l'}, {'m', 'p'}, {'q', 'z'}}},
+		{"identical", []rr{{'a', 'c'}, {'a', 'c'}}, []rr{{'a', 'c'}}},
+		{"shared low", []rr{{'a', 'c'}, {'a', 'z'}}, []rr{{'a', 'c'}, {'d', 'z'}}},
+		{"shared high", []rr{{'a', 'z'}, {'x', 'z'}}, []rr{{'a', 'w'}, {'x', 'z'}}},
+		{"touching", []rr{{'a', 'm'}, {'m', 'z'}}, []rr{{'a', 'l'}, {'m', 'm'}, {'n', 'z'}}},
+		{"gap omitted", []rr{{'a', 'c'}, {'b', 'd'}, {'x', 'z'}}, []rr{{'a', 'a'}, {'b', 'c'}, {'d', 'd'}, {'x', 'z'}}},
+		{"three way", []rr{{'a', 'f'}, {'c', 'h'}, {'e', 'j'}},
+			[]rr{{'a', 'b'}, {'c', 'd'}, {'e', 'f'}, {'g', 'h'}, {'i', 'j'}}},
+		{"terminal", []rr{{-1, -1}, {0, utf8.MaxRune}}, []rr{{-1, -1}, {0, utf8.MaxRune}}},
+	}
+	for _, c := range cases {
+		in := statesOf(c.in)
+		got := disjointRanges(in)
+		ranges := make([]rr, len(got))
+		for i, d := range got {
+			ranges[i] = d.runeRange
+		}
+		if !slices.Equal(ranges, c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, ranges, c.want)
+			continue
+		}
+		// each output must carry exactly the inputs that contain it, in any order
+		for _, d := range got {
+			want := slices.DeleteFunc(slices.Clone(in), func(s *NFAState) bool { return s.low > d.low || d.high > s.high })
+			if len(d.states) != len(want) || slices.ContainsFunc(want, func(s *NFAState) bool { return !slices.Contains(d.states, s) }) {
+				t.Errorf("%s %v: got %d covering states, want %d", c.name, d.runeRange, len(d.states), len(want))
+			}
+		}
+	}
+}
+
+// statesOf wraps ranges as bare NFAStates for testing range-only helpers.
+func statesOf(ranges []runeRange) NFAStates {
+	states := make(NFAStates, len(ranges))
+	for i, r := range ranges {
+		states[i] = &NFAState{id: i, runeRange: r}
+	}
+	return states
+}
+
+func Test_Classes(t *testing.T) {
+	meta := CompileNFA(Token(0, Alt(Range('a', 'm'), Range('k', 'z'))))
+	want := []runeRange{{'a', 'j'}, {'k', 'm'}, {'n', 'z'}}
+	if !slices.Equal(meta.classes, want) {
+		t.Fatalf("got classes %v, want %v", meta.classes, want)
+	}
+	// states[0] is the root; states[1] and [2] are the ranges
+	for _, w := range []struct{ id, first, last int }{{1, 0, 1}, {2, 1, 2}} {
+		s := meta.states[w.id]
+		if s.firstClass != w.first || s.lastClass != w.last {
+			t.Errorf("state %d: got classes %d-%d, want %d-%d", w.id, s.firstClass, s.lastClass, w.first, w.last)
+		}
+	}
 }
 
 // GraphNFA outputs the NFA built from compiler in GraphViz 'dot' format.

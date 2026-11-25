@@ -1,6 +1,8 @@
 package dfa
 
 import (
+	"cmp"
+	"maps"
 	"slices"
 	"unicode/utf8"
 )
@@ -22,6 +24,8 @@ type NFAState struct {
 	runeRange              // runes this state matches; embedded so low/high are promoted
 	terminal     bool      // end of a Token; matches no rune
 	kind         int       // token kind when terminal
+	// runeRange is exactly NFAMetadata.classes[firstClass..lastClass]; unset for the root and terminals
+	firstClass, lastClass int
 }
 
 // NFAStates is a set of NFA states.
@@ -33,7 +37,8 @@ type Compiler func(meta *NFAMetadata, prevStates NFAStates) NFAStates
 
 // NFAMetadata captured while compiling the grammar to an NFA, with states[0] as the root.
 type NFAMetadata struct {
-	states NFAStates // list of all states that have been created (doubles as NFAState.id generator)
+	states  NFAStates   // list of all states that have been created (doubles as NFAState.id generator)
+	classes []runeRange // character classes: disjoint, sorted by low; runes in a class are interchangeable
 }
 
 // Range matches an input rune between low and high inclusive
@@ -162,5 +167,58 @@ func CompileNFA(compiler Compiler) *NFAMetadata {
 	meta := &NFAMetadata{}
 	// the root's followStates are the grammar's first runes, giving a single start state
 	Seq(Any(), compiler)(meta, nil)
+	assignClasses(meta)
 	return meta
+}
+
+// assignClasses partitions the runes matched by the grammar into character classes. The root and
+// terminals are excluded: the root is never matched against a rune and terminals match none.
+func assignClasses(meta *NFAMetadata) {
+	states := slices.DeleteFunc(slices.Clone(meta.states[1:]), func(s *NFAState) bool { return s.terminal })
+	for _, d := range disjointRanges(states) {
+		meta.classes = append(meta.classes, d.runeRange)
+	}
+	// every state range starts and ends on a class boundary, so both searches find exact matches
+	for _, s := range states {
+		s.firstClass, _ = slices.BinarySearchFunc(meta.classes, s.low, func(c runeRange, r rune) int { return cmp.Compare(c.low, r) })
+		s.lastClass, _ = slices.BinarySearchFunc(meta.classes, s.high, func(c runeRange, r rune) int { return cmp.Compare(c.high, r) })
+	}
+}
+
+// disjointRange is an output range of disjointRanges and the input states whose range covers it.
+type disjointRange struct {
+	runeRange
+	states NFAStates
+}
+
+// disjointRanges splits the ranges of states at every boundary so that no two output ranges
+// overlap and each output range lies entirely inside or entirely outside every input range.
+// Each output carries the states covering it. Gaps not covered by any state are omitted and
+// output is sorted by low.
+// eg [a-m] [k-z] -> [a-j]{1} [k-m]{1,2} [n-z]{2}
+func disjointRanges(states NFAStates) []disjointRange {
+	// sweep line: a state becomes active at low and inactive one past high
+	opens := map[rune]NFAStates{}
+	closes := map[rune]NFAStates{}
+	for _, s := range states {
+		opens[s.low] = append(opens[s.low], s)
+		closes[s.high+1] = append(closes[s.high+1], s)
+	}
+	// boundaries where one state closes as another opens are kept so adjacent inputs
+	// (eg [a-c] [d-f]) stay separate
+	bounds := slices.Concat(slices.Collect(maps.Keys(opens)), slices.Collect(maps.Keys(closes)))
+	slices.Sort(bounds)
+	bounds = slices.Compact(bounds)
+	result := []disjointRange{}
+	active := NFAStates{}
+	for i := 0; i < len(bounds)-1; i++ {
+		b := bounds[i]
+		active = slices.DeleteFunc(active, func(s *NFAState) bool { return slices.Contains(closes[b], s) })
+		active = append(active, opens[b]...)
+		if len(active) > 0 {
+			// cloned since active is mutated by later boundaries
+			result = append(result, disjointRange{runeRange{b, bounds[i+1] - 1}, slices.Clone(active)})
+		}
+	}
+	return result
 }

@@ -10,14 +10,14 @@ import (
 type Matcher func(r rune) bool
 
 type State struct {
-	id         int      // id of state (used to debug and graph state machine)
-	nextStates []*State // possible outbound state nextStates
+	id         int    // id of state (used to debug and graph state machine)
+	nextStates States // possible outbound state nextStates
 	low        rune
 	high       rune
 	pos        int // track pos of state in input stream
 }
 
-type States = []*State
+type States []*State
 
 type Compiler func(meta *Metadata, prevTail States) States
 

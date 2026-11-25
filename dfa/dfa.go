@@ -3,7 +3,6 @@ package dfa
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 )
 
@@ -11,44 +10,6 @@ var (
 	ErrUnexpectedEOI   = errors.New("unexpected end of input")
 	ErrGrammarMismatch = errors.New("input does not match grammar")
 )
-
-// disjointRange is an output range of disjointRanges and the input states whose range covers it.
-type disjointRange struct {
-	runeRange
-	states NFAStates
-}
-
-// disjointRanges splits the ranges of states at every boundary so that no two output ranges
-// overlap and each output range lies entirely inside or entirely outside every input range.
-// Each output carries the states covering it. Gaps not covered by any state are omitted and
-// output is sorted by low.
-// eg [a-m] [k-z] -> [a-j]{1} [k-m]{1,2} [n-z]{2}
-func disjointRanges(states NFAStates) []disjointRange {
-	// sweep line: a state becomes active at low and inactive one past high
-	opens := map[rune]NFAStates{}
-	closes := map[rune]NFAStates{}
-	for _, s := range states {
-		opens[s.low] = append(opens[s.low], s)
-		closes[s.high+1] = append(closes[s.high+1], s)
-	}
-	// boundaries where one state closes as another opens are kept so adjacent inputs
-	// (eg [a-c] [d-f]) stay separate
-	bounds := slices.Concat(slices.Collect(maps.Keys(opens)), slices.Collect(maps.Keys(closes)))
-	slices.Sort(bounds)
-	bounds = slices.Compact(bounds)
-	result := []disjointRange{}
-	active := NFAStates{}
-	for i := 0; i < len(bounds)-1; i++ {
-		b := bounds[i]
-		active = slices.DeleteFunc(active, func(s *NFAState) bool { return slices.Contains(closes[b], s) })
-		active = append(active, opens[b]...)
-		if len(active) > 0 {
-			// cloned since active is mutated by later boundaries
-			result = append(result, disjointRange{runeRange{b, bounds[i+1] - 1}, slices.Clone(active)})
-		}
-	}
-	return result
-}
 
 // DFAState is a state of the DFA built by CompileDFA. Ranges live on the transitions rather than
 // the states, so each DFA state corresponds to exactly one set of NFA states.
@@ -102,11 +63,29 @@ func buildDFA(nfa *NFAMetadata) *DFAMetadata {
 	add(followUnion(NFAStates{nfa.states[0]}))
 	// dfaStates doubles as the work queue: states appended by add() are processed in turn
 	for i := 0; i < len(dfaStates); i++ {
-		for _, d := range disjointRanges(dfaStates[i].nfaStates) {
+		for _, d := range classRanges(dfaStates[i].nfaStates, nfa.classes) {
 			addTransition(dfaStates[i], d.runeRange, add(followUnion(d.states)))
 		}
 	}
 	return &DFAMetadata{states: dfaStates}
+}
+
+// classRanges groups states by the character classes they cover, sorted by class. Classes covered
+// by no state are omitted. Neighbouring classes with the same states are merged by addTransition.
+func classRanges(states NFAStates, classes []runeRange) []disjointRange {
+	byClass := make([]NFAStates, len(classes))
+	for _, s := range states {
+		for c := s.firstClass; c <= s.lastClass; c++ {
+			byClass[c] = append(byClass[c], s)
+		}
+	}
+	result := []disjointRange{}
+	for c, covering := range byClass {
+		if len(covering) > 0 {
+			result = append(result, disjointRange{classes[c], covering})
+		}
+	}
+	return result
 }
 
 // addTransition appends a transition, merging it into the previous one when both lead to the
