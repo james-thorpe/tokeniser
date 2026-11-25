@@ -2,45 +2,47 @@ package dfa
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"unicode/utf8"
 )
 
+// runeRange is an inclusive range of runes low...high
+type runeRange struct {
+	low, high rune
+}
+
 // Matcher returns true to indicate that a transition is valid for the rune r
 type Matcher func(r rune) bool
 
-type State struct {
-	id         int      // id of state (used to debug and graph state machine)
-	nextStates []*State // possible outbound state nextStates
-	low        rune
-	high       rune
-	pos        int // track pos of state in input stream
+type NFAState struct {
+	id           int         // id of state (used to debug and graph state machine)
+	followStates []*NFAState // states that can match the rune following this one
+	runeRange                // runes this state matches; embedded so low/high are promoted
 }
 
-type States = []*State
+type NFAStates = []*NFAState
 
-type Compiler func(meta *Metadata, prevTail States) States
+type Compiler func(meta *Metadata, prevStates NFAStates) NFAStates
 
 // Metadata captured during the compilation process. It is used to graph the state machines.
 type Metadata struct {
-	states States // list of all states that have been created (doubles as State.id generator)
+	states NFAStates // list of all states that have been created (doubles as NFAState.id generator)
 }
 
 var ErrUnexpectedEOI = errors.New("unexpected end of input")
 var ErrGrammarMismatch = errors.New("input does not match grammar")
 
 func Match(runeLow rune, runeHigh rune) Compiler {
-	return func(meta *Metadata, prevTail States) States {
-		state := &State{
-			nextStates: States{},
-			id:         len(meta.states),
-			low:        runeLow,
-			high:       runeHigh,
-			pos:        -1}
-		states := States{state}
+	return func(meta *Metadata, prevStates NFAStates) NFAStates {
+		state := &NFAState{
+			followStates: NFAStates{},
+			id:           len(meta.states),
+			runeRange:    runeRange{runeLow, runeHigh}}
+		states := NFAStates{state}
 		// connect previous states to this state
-		connect(prevTail, states)
+		connect(prevStates, states)
 		// update metadata
 		meta.states = append(meta.states, state)
 		return states
@@ -72,27 +74,27 @@ func Range(low, high rune) Compiler {
 }
 
 func Seq(compilers ...any) Compiler {
-	return func(meta *Metadata, prevTail States) States {
+	return func(meta *Metadata, prevStates NFAStates) NFAStates {
 		for _, compiler := range compilers {
-			prevTail = convertToCompiler(compiler)(meta, prevTail) // tail = prevTail for each iteration
+			prevStates = convertToCompiler(compiler)(meta, prevStates) // tail = prevStates for each iteration
 		}
-		return prevTail
+		return prevStates
 	}
 }
 
 func Optional(compilers ...any) Compiler {
-	return func(meta *Metadata, prevTail States) States {
-		tail := Seq(compilers...)(meta, prevTail)
-		return append(prevTail, tail...) // returning prevTail creates a bypass path
+	return func(meta *Metadata, prevStates NFAStates) NFAStates {
+		tail := Seq(compilers...)(meta, prevStates)
+		return append(prevStates, tail...) // returning prevStates creates a bypass path
 	}
 }
 
 func OneOrMore(compilers ...any) Compiler {
-	return func(meta *Metadata, prevTail States) States {
-		firstHeadIx := len(prevTail[0].nextStates) // identify no. of pre-existing transitions
-		tail := Seq(compilers...)(meta, prevTail)
-		head := prevTail[0].nextStates[firstHeadIx:] // get new transitions as the head of this fragment
-		connect(tail, head)                          // loop back to the head
+	return func(meta *Metadata, prevStates NFAStates) NFAStates {
+		firstHeadIx := len(prevStates[0].followStates) // identify no. of pre-existing transitions
+		tail := Seq(compilers...)(meta, prevStates)
+		head := prevStates[0].followStates[firstHeadIx:] // get new transitions as the head of this fragment
+		connect(tail, head)                              // loop back to the head
 		return tail
 	}
 }
@@ -102,10 +104,10 @@ func ZeroOrMore(compilers ...any) Compiler {
 }
 
 func Alt(alternatives ...any) Compiler {
-	return func(meta *Metadata, prevTail States) States {
-		tail := States{}
+	return func(meta *Metadata, prevStates NFAStates) NFAStates {
+		tail := NFAStates{}
 		for _, alt := range alternatives {
-			altTail := convertToCompiler(alt)(meta, prevTail)
+			altTail := convertToCompiler(alt)(meta, prevStates)
 			tail = append(tail, altTail...)
 		}
 		return tail
@@ -126,113 +128,167 @@ func convertToCompiler(obj any) Compiler {
 }
 
 // connect each source state to each destination state by adding the destination states
-// to the source state.nextStates slice. We ensure that there are no duplicate states.
-func connect(sourceStates States, destStates States) {
+// to the source state.followStates slice. We ensure that there are no duplicate states.
+func connect(sourceStates NFAStates, destStates NFAStates) {
 	for _, source := range sourceStates {
 		for _, dest := range destStates {
 			// add dest to source transitions if not already added
-			if !slices.Contains(source.nextStates, dest) {
-				source.nextStates = append(source.nextStates, dest)
+			if !slices.Contains(source.followStates, dest) {
+				source.followStates = append(source.followStates, dest)
 			}
 		}
 	}
 }
 
-func compile(compiler Compiler) (start *State, end *State, meta *Metadata) {
-	meta = &Metadata{states: States{}}
+func CompileNFA(compiler Compiler) (start *NFAState, end *NFAState, meta *Metadata) {
+	meta = &Metadata{states: NFAStates{}}
 	// append a start and end state to the grammar.  This makes Run() simpler
-	tail := Seq(Any(), compiler, rune(-1))(meta, States{})
+	tail := Seq(Any(), compiler, rune(-1))(meta, NFAStates{})
 	return meta.states[0], tail[0], meta //
 }
 
-// intersection returns the overlapping rune range of a and b, or -1, -1 if they are disjoint.
-func intersection(a, b *State) (low, high rune) {
-	low = max(a.low, b.low)
-	high = min(a.high, b.high)
-	return low, high
+// disjointRange is an output range of disjointRanges and the input states whose range covers it.
+type disjointRange struct {
+	runeRange
+	states NFAStates
 }
 
-// runeRange is an inclusive range of runes low...high
-type runeRange struct {
-	low, high rune
-}
-
-// disjointRanges splits ranges at every boundary so that no two output ranges overlap and each
-// output range lies entirely inside or entirely outside every input range. Gaps not covered by
-// any input are omitted and output is sorted by low.
-// eg [a-m] [k-z] -> [a-j] [k-m] [n-z]
-func disjointRanges(ranges []runeRange) []runeRange {
-	// sweep line: +1 where a range opens, -1 one past where it closes
-	delta := map[rune]int{}
-	for _, r := range ranges {
-		if r.low > r.high {
+// disjointRanges splits the ranges of states at every boundary so that no two output ranges
+// overlap and each output range lies entirely inside or entirely outside every input range.
+// Each output carries the states covering it. Gaps not covered by any state are omitted and
+// output is sorted by low.
+// eg [a-m] [k-z] -> [a-j]{1} [k-m]{1,2} [n-z]{2}
+func disjointRanges(states NFAStates) []disjointRange {
+	// sweep line: a state becomes active at low and inactive one past high
+	opens := map[rune]NFAStates{}
+	closes := map[rune]NFAStates{}
+	for _, s := range states {
+		if s.low > s.high {
 			continue
 		}
-		delta[r.low]++
-		delta[r.high+1]--
+		opens[s.low] = append(opens[s.low], s)
+		closes[s.high+1] = append(closes[s.high+1], s)
 	}
-	// boundaries with a net delta of 0 are kept so adjacent inputs (eg [a-c] [d-f]) stay separate
-	bounds := slices.Sorted(maps.Keys(delta))
-	result := []runeRange{}
-	active := 0
+	// boundaries where one state closes as another opens are kept so adjacent inputs
+	// (eg [a-c] [d-f]) stay separate
+	bounds := slices.Concat(slices.Collect(maps.Keys(opens)), slices.Collect(maps.Keys(closes)))
+	slices.Sort(bounds)
+	bounds = slices.Compact(bounds)
+	result := []disjointRange{}
+	active := NFAStates{}
 	for i := 0; i < len(bounds)-1; i++ {
-		active += delta[bounds[i]]
-		if active > 0 {
-			result = append(result, runeRange{bounds[i], bounds[i+1] - 1})
+		b := bounds[i]
+		active = slices.DeleteFunc(active, func(s *NFAState) bool { return slices.Contains(closes[b], s) })
+		active = append(active, opens[b]...)
+		if len(active) > 0 {
+			// cloned since active is mutated by later boundaries
+			result = append(result, disjointRange{runeRange{b, bounds[i+1] - 1}, slices.Clone(active)})
 		}
 	}
 	return result
 }
 
-// calculate the intersecting char matches for each state and create a shared state containing the overlap
-// eg Alt("ab", "ac") -> Seq("a", Alt("b", "c")
-func nfaToDfa(meta *Metadata) {
-	// for each state create a disjoint set of next states
-	for i := 0; i < len(meta.states); i++ {
-		state := meta.states[i]
-		if len(state.nextStates) <= 1 {
-			continue
-		}
-
-	}
+// transition is a DFA edge taken on any rune in runeRange.
+type transition struct {
+	runeRange
+	next *DFAState
 }
 
+// DFAState is a state of the DFA built by CompileDFA. Ranges live on the transitions rather than
+// the states, so each DFA state corresponds to exactly one set of NFA states.
+type DFAState struct {
+	id          int
+	transitions []transition // sorted by low and pairwise disjoint
+	accept      bool         // input may end in this state
+}
+
+// CompileDFA compiles the grammar to an NFA and builds a DFA from it, rooted at the NFA's first
+// state (subset construction). Each DFA state represents the set of NFA states that may match
+// the next rune. The NFA terminal is folded into DFAState.accept, so the DFA has no -1
+// transitions. Returns the start state; every other state is reachable from it.
+func CompileDFA(compiler Compiler) *DFAState {
+	_, nfaEnd, nfa := CompileNFA(compiler)
+	dfaStates := []*DFAState{}
+	sets := []NFAStates{} // sets[i] is the NFA states that may match the next rune in states[i]
+	index := map[string]*DFAState{}
+	add := func(followUnionStates NFAStates) *DFAState {
+		key := followUnionKey(followUnionStates)
+		if state, ok := index[key]; ok {
+			return state
+		}
+		dfaState := &DFAState{id: len(dfaStates), accept: slices.Contains(followUnionStates, nfaEnd)}
+		index[key] = dfaState
+		dfaStates = append(dfaStates, dfaState)
+		sets = append(sets, followUnionStates)
+		return dfaState
+	}
+	add(followUnion(NFAStates{nfa.states[0]}))
+	// states doubles as the work queue: states appended by add() are processed in turn
+	for i := 0; i < len(dfaStates); i++ {
+		next := slices.DeleteFunc(slices.Clone(sets[i]), func(s *NFAState) bool { return s == nfaEnd })
+		for _, d := range disjointRanges(next) {
+			addTransition(dfaStates[i], d.runeRange, add(followUnion(d.states)))
+		}
+	}
+	return dfaStates[0]
+}
+
+// addTransition appends a transition, merging it into the previous one when both lead to the
+// same state over contiguous ranges. Ranges must be added in ascending order.
+func addTransition(state *DFAState, r runeRange, next *DFAState) {
+	last := len(state.transitions) - 1
+	if last >= 0 && state.transitions[last].next == next && state.transitions[last].high+1 == r.low {
+		state.transitions[last].high = r.high
+		return
+	}
+	state.transitions = append(state.transitions, transition{r, next})
+}
+
+// followUnion returns the union of followStates for the input state (sorted by id so equal sets
+// produce equal followUnionKey keys)
+func followUnion(states NFAStates) NFAStates {
+	next := NFAStates{}
+	for _, state := range states {
+		next = append(next, state.followStates...)
+	}
+	slices.SortFunc(next, func(a, b *NFAState) int { return a.id - b.id })
+	return slices.Compact(next)
+}
+
+// followUnionKey creates a unique key for the states.
+func followUnionKey(states NFAStates) string {
+	ids := make([]int, len(states))
+	for i, state := range states {
+		ids[i] = state.id
+	}
+	return fmt.Sprint(ids)
+}
+
+// Run compiles the grammar to an NFA, converts it to a DFA and matches input against the DFA.
 func Run(compiler Compiler, input []rune) (err error) {
-	start, end, _ := compile(compiler)
-	input = append(input, rune(-1))  // Add terminal to input. Don't do this in production. Inefficient!
-	running := make(States, 0, 8)    // states that are being matched against the current rune
-	pending := make(States, 0, 8)    // states that will be matched against the next rune
-	running = append(running, start) // set start state
-	for pos, r := range input {
-		// for each running state ...
-		for _, state := range running {
-			// transition to nextState if possible
-			for _, nextState := range state.nextStates {
-				// if nextState is at this position then it is already pending so we can skip it
-				// otherwise if NextState matches input add to pending
-				if nextState.pos != pos && (r >= nextState.low && r <= nextState.high) {
-					nextState.pos = pos
-					// if nextState == end then we must also be at the end of the input (r == -1)
-					// so we are all done.
-					if nextState == end {
-						return nil
-					}
-					// add nextState to pending so it becomes a running state for the next rune
-					pending = append(pending, nextState)
-				}
+	return runDFA(CompileDFA(compiler), input)
+}
+
+// runDFA executes a DFA from CompileDFA. Only one state is live at a time and the graph is not
+// mutated, so a DFA can be reused across runs.
+func runDFA(start *DFAState, input []rune) error {
+	state := start
+	for _, r := range input {
+		var next *DFAState
+		// transitions are disjoint so the first match is the only match
+		for _, t := range state.transitions {
+			if r >= t.low && r <= t.high {
+				next = t.next
+				break
 			}
 		}
-		// if r == -1 then we are at the end of the file but not the end of the grammar
-		if r == -1 {
-			return ErrUnexpectedEOI
-		}
-		// no valid pending states ... so exit with error
-		if len(pending) == 0 {
+		if next == nil {
 			return ErrGrammarMismatch
 		}
-		// swap running and pending states and clear the pending state for next iteration
-		running, pending = pending, running
-		pending = pending[:0]
+		state = next
+	}
+	if !state.accept {
+		return ErrUnexpectedEOI
 	}
 	return nil
 }

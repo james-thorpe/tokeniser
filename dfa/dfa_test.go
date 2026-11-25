@@ -133,7 +133,79 @@ func Test_Number(t *testing.T) {
 	test(t, "1_234", decimal)
 	testE(t, "1__234", decimal, ErrGrammarMismatch) // multiple consecutive underscores not allowed
 	testE(t, "1_", decimal, ErrUnexpectedEOI)       // underscore must be followed by number
-	//	graph(decimal)
+	graphNFA(decimal)
+	graphDFA(decimal)
+}
+
+func Test_Float(t *testing.T) {
+
+	digits := Seq(Range('0', '9'), ZeroOrMore(Optional('_'), Range('0', '9')))
+	integer := Alt('0', Seq(Range('1', '9'), Optional(Optional('_'), digits)))
+	exponent := Seq(Alt('e', 'E'), Optional(Alt('+', '-')), digits)
+	float := Seq(integer, Optional('.', digits), Optional(exponent))
+
+	// integer with optional fraction and exponent
+	test(t, "0", float)
+	test(t, "1", float)
+	test(t, "10", float)
+	test(t, "0.5", float)
+	test(t, "3.14159", float)
+	test(t, "1.5e3", float)
+	test(t, "6.022e23", float)
+	test(t, "1E-7", float)
+	test(t, "1e+10", float)
+	test(t, "0e0", float)
+
+	// numeric separators
+	test(t, "1_000", float)
+	test(t, "1_000.000_1", float)
+	test(t, "0.000_001", float)
+	test(t, "1e1_0", float)
+	test(t, "1.0e007", float) // leading zeros are allowed in the fraction and exponent
+
+	// incomplete input
+	testE(t, "", float, ErrUnexpectedEOI)
+	testE(t, "0.", float, ErrUnexpectedEOI) // "." must be followed by digits
+	testE(t, "1.", float, ErrUnexpectedEOI)
+	testE(t, "1e", float, ErrUnexpectedEOI)
+	testE(t, "1e-", float, ErrUnexpectedEOI)
+	testE(t, "1.5e", float, ErrUnexpectedEOI)
+	testE(t, "1_", float, ErrUnexpectedEOI) // separator must be followed by a digit
+	testE(t, "1.5_", float, ErrUnexpectedEOI)
+
+	// an integer part is required
+	testE(t, ".", float, ErrGrammarMismatch)
+	testE(t, ".5", float, ErrGrammarMismatch)
+	testE(t, ".5e-3", float, ErrGrammarMismatch)
+
+	// "." must be followed by digits, not the exponent
+	testE(t, "1.e5", float, ErrGrammarMismatch)
+	testE(t, "1.E-7", float, ErrGrammarMismatch)
+
+	// leading zeros: legacy octal-like literals are a syntax error in strict mode
+	testE(t, "00", float, ErrGrammarMismatch)
+	testE(t, "01", float, ErrGrammarMismatch)
+	testE(t, "072.40", float, ErrGrammarMismatch)
+	testE(t, "0_1", float, ErrGrammarMismatch) // separator is not allowed after a leading 0
+
+	// separators must sit between two digits
+	testE(t, "1__0", float, ErrGrammarMismatch)
+	testE(t, "1_.5", float, ErrGrammarMismatch)
+	testE(t, "1._5", float, ErrGrammarMismatch)
+	testE(t, "1_e5", float, ErrGrammarMismatch)
+	testE(t, "1e_5", float, ErrGrammarMismatch)
+
+	// other invalid input
+	testE(t, "1..5", float, ErrGrammarMismatch)
+	testE(t, "1.5.5", float, ErrGrammarMismatch)
+	testE(t, "1e+-5", float, ErrGrammarMismatch)
+	testE(t, "1e3.5", float, ErrGrammarMismatch)
+	testE(t, "e5", float, ErrGrammarMismatch)
+	testE(t, "+1", float, ErrGrammarMismatch)   // sign is a unary operator, not part of the literal
+	testE(t, "0x10", float, ErrGrammarMismatch) // hex is a separate NumericLiteral production
+	testE(t, "1n", float, ErrGrammarMismatch)   // BigInt suffix is not a DecimalLiteral
+	graphDFA(Alt("abc", "dbc"))
+	// graphDFA(float)
 }
 
 func Test_RuneInput(t *testing.T) {
@@ -170,76 +242,45 @@ func testE(t *testing.T, input string, exp Compiler, expectedErr error) {
 	}
 }
 
-func test_DFA(t *testing.T) {
-
-}
-
-// label renders a state's rune range for graph transitions
-func label(s *State) string {
+// rangeLabel renders a rune range as a dot label, escaping characters that would end the label.
+func rangeLabel(r runeRange) string {
+	escape := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace
 	switch {
-	case s.low == 0 && s.high == utf8.MaxRune:
+	case r.low == 0 && r.high == utf8.MaxRune:
 		return "∀"
-	case s.low == s.high:
-		return string(s.low)
+	case r.low == r.high:
+		return escape(string(r.low))
 	default:
-		return string(s.low) + "-" + string(s.high)
+		return escape(string(r.low)) + "-" + escape(string(r.high))
 	}
 }
 
-func graph(exp Compiler) {
+func graphDFA(exp Compiler) {
 	var builder strings.Builder
-	Graph(&builder, exp)
+	GraphDFA(&builder, exp)
 	println(builder.String())
 }
 
-// Graph output state machine in GraphViz 'dot' format
-func Graph(writer io.Writer, compiler Compiler) {
-	start, end, meta := compile(compiler)
+// GraphDFA outputs the DFA built from compiler in GraphViz 'dot' format.
+// Accepting states are double circles; the start state is marked by an arrow from a point.
+func GraphDFA(writer io.Writer, compiler Compiler) {
+	states := dfaStates(CompileDFA(compiler))
 
 	_, _ = fmt.Fprintf(writer, "digraph {\n  rankdir=LR;\n  node [fixedsize=true];\n")
-	// render the nodes
-	for _, state := range meta.states {
-		if state == start || state == end {
-			_, _ = fmt.Fprintf(writer, "  %d [shape=\"doublecircle\"];\n", state.id)
-		} else {
-			_, _ = fmt.Fprintf(writer, "  %d [shape=\"circle\"];\n", state.id)
+	_, _ = fmt.Fprintf(writer, "  start [shape=\"point\"];\n  start -> 0 [arrowsize=0.7];\n")
+	for _, state := range states {
+		shape := "circle"
+		if state.accept {
+			shape = "doublecircle"
 		}
+		_, _ = fmt.Fprintf(writer, "  %d [shape=\"%s\"];\n", state.id, shape)
 	}
-	// render the transitions
-	for _, state := range meta.states {
-		for _, transition := range state.nextStates {
-			if transition == end {
-				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"δ\"];\n", state.id, transition.id)
-			} else {
-				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, transition.id, label(transition))
-			}
-
+	for _, state := range states {
+		for _, t := range state.transitions {
+			_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, t.next.id, rangeLabel(t.runeRange))
 		}
 	}
 	_, _ = fmt.Fprintf(writer, "}\n")
-}
-
-func Test_Intersection(t *testing.T) {
-	st := func(lo, hi rune) *State { return &State{low: lo, high: hi} }
-	cases := []struct {
-		a, b      *State
-		low, high rune
-	}{
-		{st('a', 'z'), st('m', 'p'), 'm', 'p'}, // contained
-		{st('a', 'm'), st('k', 'z'), 'k', 'm'}, // partial overlap
-		{st('k', 'z'), st('a', 'm'), 'k', 'm'}, // order independent
-		{st('a', 'm'), st('m', 'z'), 'm', 'm'}, // touching bounds are inclusive
-		{st('a', 'c'), st('d', 'f'), -1, -1},   // adjacent but disjoint
-		{st('x', 'z'), st('a', 'c'), -1, -1},   // disjoint
-		{st('a', 'a'), st('a', 'a'), 'a', 'a'}, // identical single rune
-	}
-	for _, c := range cases {
-		low, high := intersection(c.a, c.b)
-		if low != c.low || high != c.high {
-			t.Errorf("intersection(%c-%c, %c-%c) = %d,%d; want %d,%d",
-				c.a.low, c.a.high, c.b.low, c.b.high, low, high, c.low, c.high)
-		}
-	}
 }
 
 func Test_DisjointRanges(t *testing.T) {
@@ -266,8 +307,187 @@ func Test_DisjointRanges(t *testing.T) {
 		{"terminal", []rr{{-1, -1}, {0, utf8.MaxRune}}, []rr{{-1, -1}, {0, utf8.MaxRune}}},
 	}
 	for _, c := range cases {
-		if got := disjointRanges(c.in); !slices.Equal(got, c.want) {
-			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		in := statesOf(c.in)
+		got := disjointRanges(in)
+		ranges := make([]rr, len(got))
+		for i, d := range got {
+			ranges[i] = d.runeRange
+		}
+		if !slices.Equal(ranges, c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, ranges, c.want)
+			continue
+		}
+		// each output must carry exactly the inputs that contain it, in any order
+		for _, d := range got {
+			want := slices.DeleteFunc(slices.Clone(in), func(s *NFAState) bool { return s.low > d.low || d.high > s.high })
+			if len(d.states) != len(want) || slices.ContainsFunc(want, func(s *NFAState) bool { return !slices.Contains(d.states, s) }) {
+				t.Errorf("%s %v: got %d covering states, want %d", c.name, d.runeRange, len(d.states), len(want))
+			}
 		}
 	}
+}
+
+// statesOf wraps ranges as bare NFAStates for testing range-only helpers.
+func statesOf(ranges []runeRange) NFAStates {
+	states := make(NFAStates, len(ranges))
+	for i, r := range ranges {
+		states[i] = &NFAState{id: i, runeRange: r}
+	}
+	return states
+}
+
+func Test_NFAToDFA(t *testing.T) {
+	type tc struct {
+		input string
+		want  error
+	}
+	grammars := []struct {
+		name  string
+		c     Compiler
+		cases []tc
+	}{
+		{"(a|b)*ab", Seq(ZeroOrMore(Alt('a', 'b')), 'a', 'b'), []tc{
+			{"", ErrUnexpectedEOI}, {"a", ErrUnexpectedEOI}, {"b", ErrUnexpectedEOI}, {"ab", nil}, {"aab", nil},
+			{"abab", nil}, {"bbab", nil}, {"aba", ErrUnexpectedEOI}, {"abc", ErrGrammarMismatch}, {"abb", ErrUnexpectedEOI}}},
+		{"common prefix", Alt("abc", "abd", "ab"), []tc{
+			{"", ErrUnexpectedEOI}, {"a", ErrUnexpectedEOI}, {"ab", nil}, {"abc", nil}, {"abd", nil},
+			{"abe", ErrGrammarMismatch}, {"abcd", ErrGrammarMismatch}}},
+		{"overlapping ranges", Seq(Alt(Range('a', 'm'), Range('k', 'z')), '!'), []tc{
+			{"a!", nil}, {"l!", nil}, {"z!", nil}, {"0!", ErrGrammarMismatch}, {"l", ErrUnexpectedEOI},
+			{"ll!", ErrGrammarMismatch}}},
+		{"any", Seq(Any(), 'x'), []tc{
+			{"ax", nil}, {"日x", nil}, {"xx", nil}, {"x", ErrUnexpectedEOI}, {"a", ErrUnexpectedEOI}}},
+		{"optional", Seq(Optional('a'), 'b'), []tc{
+			{"", ErrUnexpectedEOI}, {"a", ErrUnexpectedEOI}, {"b", nil}, {"ab", nil}, {"aab", ErrGrammarMismatch}}},
+		{"one or more", OneOrMore("abc"), []tc{
+			{"", ErrUnexpectedEOI}, {"abc", nil}, {"abcabc", nil}, {"abcab", ErrUnexpectedEOI}, {"abd", ErrGrammarMismatch}}},
+		{"decimal", Alt('0', Seq(Range('1', '9'), ZeroOrMore(Optional('_'), Range('0', '9')))), []tc{
+			{"0", nil}, {"00", ErrGrammarMismatch}, {"1", nil}, {"123", nil}, {"1_234", nil},
+			{"1__234", ErrGrammarMismatch}, {"1_", ErrUnexpectedEOI}, {"", ErrUnexpectedEOI}}},
+	}
+	for _, g := range grammars {
+		start := CompileDFA(g.c)
+		assertDeterministic(t, g.name, dfaStates(start))
+		// one DFA serves every input since runDFA does not mutate it
+		for _, c := range g.cases {
+			if got := runDFA(start, []rune(c.input)); got != c.want {
+				t.Errorf("%s %q: got %v, want %v", g.name, c.input, got, c.want)
+			}
+		}
+	}
+}
+
+func Test_NFAToDFAShape(t *testing.T) {
+	// (a|b)*ab: A = start, B = seen a, C = seen ab (accepting)
+	states := dfaStates(CompileDFA(Seq(ZeroOrMore(Alt('a', 'b')), 'a', 'b')))
+	if len(states) != 3 {
+		t.Fatalf("(a|b)*ab: got %d states, want 3", len(states))
+	}
+	a := states[0]
+	b := step(a, 'a')
+	c := step(b, 'b')
+	want := []struct {
+		from, onA, onB *DFAState
+		accept         bool
+	}{
+		{a, b, a, false},
+		{b, b, c, false},
+		{c, b, a, true},
+	}
+	for _, w := range want {
+		if step(w.from, 'a') != w.onA || step(w.from, 'b') != w.onB || w.from.accept != w.accept {
+			t.Errorf("(a|b)*ab: state %d has wrong transitions or accept", w.from.id)
+		}
+	}
+
+	// contiguous ranges to the same state merge into a single transition
+	got := CompileDFA(Alt('a', 'b', 'c')).transitions
+	if len(got) != 1 || got[0].runeRange != (runeRange{'a', 'c'}) {
+		t.Errorf("Alt('a','b','c'): got transitions %v, want single a-c", got)
+	}
+}
+
+// assertDeterministic checks that every DFA state's transitions are sorted and share no rune.
+func assertDeterministic(t *testing.T, name string, states []*DFAState) {
+	for _, state := range states {
+		for i := 1; i < len(state.transitions); i++ {
+			prev, cur := state.transitions[i-1], state.transitions[i]
+			if cur.low <= prev.high {
+				t.Errorf("%s: state %d has overlapping or unsorted transitions %c-%c and %c-%c",
+					name, state.id, prev.low, prev.high, cur.low, cur.high)
+			}
+		}
+	}
+}
+
+// step returns the state reached from s on rune r, or nil if there is no transition.
+func step(s *DFAState, r rune) *DFAState {
+	for _, t := range s.transitions {
+		if r >= t.low && r <= t.high {
+			return t.next
+		}
+	}
+	return nil
+}
+
+// dfaStates returns every state reachable from start, ordered by id.
+func dfaStates(start *DFAState) []*DFAState {
+	states := []*DFAState{start}
+	seen := map[*DFAState]bool{start: true}
+	// states doubles as the work queue
+	for i := 0; i < len(states); i++ {
+		for _, t := range states[i].transitions {
+			if !seen[t.next] {
+				seen[t.next] = true
+				states = append(states, t.next)
+			}
+		}
+	}
+	slices.SortFunc(states, func(a, b *DFAState) int { return a.id - b.id })
+	return states
+}
+
+// label renders a state's rune range for nfaGraph transitions
+func label(s *NFAState) string {
+	switch {
+	case s.low == 0 && s.high == utf8.MaxRune:
+		return "∀"
+	case s.low == s.high:
+		return string(s.low)
+	default:
+		return string(s.low) + "-" + string(s.high)
+	}
+}
+
+func graphNFA(exp Compiler) {
+	var builder strings.Builder
+	GraphNFA(&builder, exp)
+	println(builder.String())
+}
+
+// GraphNFA output state machine in GraphViz 'dot' format
+func GraphNFA(writer io.Writer, compiler Compiler) {
+	start, end, meta := CompileNFA(compiler)
+
+	_, _ = fmt.Fprintf(writer, "digraph {\n  rankdir=LR;\n  node [fixedsize=true];\n")
+	// render the nodes
+	for _, state := range meta.states {
+		if state == start || state == end {
+			_, _ = fmt.Fprintf(writer, "  %d [shape=\"doublecircle\"];\n", state.id)
+		} else {
+			_, _ = fmt.Fprintf(writer, "  %d [shape=\"circle\"];\n", state.id)
+		}
+	}
+	// render the transitions
+	for _, state := range meta.states {
+		for _, transition := range state.followStates {
+			if transition == end {
+				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"δ\"];\n", state.id, transition.id)
+			} else {
+				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, transition.id, label(transition))
+			}
+
+		}
+	}
+	_, _ = fmt.Fprintf(writer, "}\n")
 }
