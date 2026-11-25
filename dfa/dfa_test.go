@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -133,8 +132,8 @@ func Test_Number(t *testing.T) {
 	test(t, "1_234", decimal)
 	testE(t, "1__234", decimal, ErrGrammarMismatch) // multiple consecutive underscores not allowed
 	testE(t, "1_", decimal, ErrUnexpectedEOI)       // underscore must be followed by number
-	graphNFA(decimal)
-	graphDFA(decimal)
+	// printGraph(GraphNFA, decimal)
+	// printGraph(GraphDFA, decimal)
 }
 
 func Test_Float(t *testing.T) {
@@ -204,8 +203,7 @@ func Test_Float(t *testing.T) {
 	testE(t, "+1", float, ErrGrammarMismatch)   // sign is a unary operator, not part of the literal
 	testE(t, "0x10", float, ErrGrammarMismatch) // hex is a separate NumericLiteral production
 	testE(t, "1n", float, ErrGrammarMismatch)   // BigInt suffix is not a DecimalLiteral
-	graphDFA(Alt("abc", "dbc"))
-	// graphDFA(float)
+	// printGraph(GraphDFA, float)
 }
 
 func Test_RuneInput(t *testing.T) {
@@ -223,22 +221,18 @@ func Test_RuneInput(t *testing.T) {
 }
 
 func test(t *testing.T, input string, exp Compiler) {
-	err := Run(exp, []rune(input))
-	if err != nil {
-		t.Errorf("expected no error, got %v", err)
-		t.Log(string(debug.Stack()))
+	t.Helper()
+	if err := Run(exp, []rune(input)); err != nil {
+		t.Errorf("%q: got %v, want no error", input, err)
 	}
 }
 
+// testE expects Run to fail with expectedErr, or with any error when expectedErr is nil.
 func testE(t *testing.T, input string, exp Compiler, expectedErr error) {
+	t.Helper()
 	err := Run(exp, []rune(input))
-	if err == nil {
-		t.Errorf("expected error, got nil")
-		t.Log(string(debug.Stack()))
-	}
-	if expectedErr != nil && !errors.Is(err, expectedErr) {
-		t.Errorf("expected error: %v", expectedErr)
-		t.Log(string(debug.Stack()))
+	if err == nil || (expectedErr != nil && !errors.Is(err, expectedErr)) {
+		t.Errorf("%q: got %v, want %v", input, err, expectedErr)
 	}
 }
 
@@ -255,18 +249,21 @@ func rangeLabel(r runeRange) string {
 	}
 }
 
-func graphDFA(exp Compiler) {
+// printGraph prints the dot output of graph for exp; used ad hoc while debugging a grammar.
+func printGraph(graph func(io.Writer, Compiler), exp Compiler) {
 	var builder strings.Builder
-	GraphDFA(&builder, exp)
+	graph(&builder, exp)
 	println(builder.String())
 }
+
+const graphHeader = "digraph {\n  rankdir=LR;\n  node [fixedsize=true];\n"
 
 // GraphDFA outputs the DFA built from compiler in GraphViz 'dot' format.
 // Accepting states are double circles; the start state is marked by an arrow from a point.
 func GraphDFA(writer io.Writer, compiler Compiler) {
-	states := dfaStates(CompileDFA(compiler))
+	states := CompileDFA(compiler).states
 
-	_, _ = fmt.Fprintf(writer, "digraph {\n  rankdir=LR;\n  node [fixedsize=true];\n")
+	_, _ = fmt.Fprint(writer, graphHeader)
 	_, _ = fmt.Fprintf(writer, "  start [shape=\"point\"];\n  start -> 0 [arrowsize=0.7];\n")
 	for _, state := range states {
 		shape := "circle"
@@ -366,11 +363,11 @@ func Test_NFAToDFA(t *testing.T) {
 			{"1__234", ErrGrammarMismatch}, {"1_", ErrUnexpectedEOI}, {"", ErrUnexpectedEOI}}},
 	}
 	for _, g := range grammars {
-		start := CompileDFA(g.c)
-		assertDeterministic(t, g.name, dfaStates(start))
+		dfa := CompileDFA(g.c)
+		assertDeterministic(t, g.name, dfa.states)
 		// one DFA serves every input since runDFA does not mutate it
 		for _, c := range g.cases {
-			if got := runDFA(start, []rune(c.input)); got != c.want {
+			if got := runDFA(dfa.states[0], []rune(c.input)); got != c.want {
 				t.Errorf("%s %q: got %v, want %v", g.name, c.input, got, c.want)
 			}
 		}
@@ -379,7 +376,7 @@ func Test_NFAToDFA(t *testing.T) {
 
 func Test_NFAToDFAShape(t *testing.T) {
 	// (a|b)*ab: A = start, B = seen a, C = seen ab (accepting)
-	states := dfaStates(CompileDFA(Seq(ZeroOrMore(Alt('a', 'b')), 'a', 'b')))
+	states := CompileDFA(Seq(ZeroOrMore(Alt('a', 'b')), 'a', 'b')).states
 	if len(states) != 3 {
 		t.Fatalf("(a|b)*ab: got %d states, want 3", len(states))
 	}
@@ -401,7 +398,7 @@ func Test_NFAToDFAShape(t *testing.T) {
 	}
 
 	// contiguous ranges to the same state merge into a single transition
-	got := CompileDFA(Alt('a', 'b', 'c')).transitions
+	got := CompileDFA(Alt('a', 'b', 'c')).states[0].transitions
 	if len(got) != 1 || got[0].runeRange != (runeRange{'a', 'c'}) {
 		t.Errorf("Alt('a','b','c'): got transitions %v, want single a-c", got)
 	}
@@ -430,63 +427,26 @@ func step(s *DFAState, r rune) *DFAState {
 	return nil
 }
 
-// dfaStates returns every state reachable from start, ordered by id.
-func dfaStates(start *DFAState) []*DFAState {
-	states := []*DFAState{start}
-	seen := map[*DFAState]bool{start: true}
-	// states doubles as the work queue
-	for i := 0; i < len(states); i++ {
-		for _, t := range states[i].transitions {
-			if !seen[t.next] {
-				seen[t.next] = true
-				states = append(states, t.next)
-			}
-		}
-	}
-	slices.SortFunc(states, func(a, b *DFAState) int { return a.id - b.id })
-	return states
-}
-
-// label renders a state's rune range for nfaGraph transitions
-func label(s *NFAState) string {
-	switch {
-	case s.low == 0 && s.high == utf8.MaxRune:
-		return "∀"
-	case s.low == s.high:
-		return string(s.low)
-	default:
-		return string(s.low) + "-" + string(s.high)
-	}
-}
-
-func graphNFA(exp Compiler) {
-	var builder strings.Builder
-	GraphNFA(&builder, exp)
-	println(builder.String())
-}
-
-// GraphNFA output state machine in GraphViz 'dot' format
+// GraphNFA outputs the NFA built from compiler in GraphViz 'dot' format.
+// The root and terminal states are double circles; edges are labelled with the target's range.
 func GraphNFA(writer io.Writer, compiler Compiler) {
 	start, end, meta := CompileNFA(compiler)
 
-	_, _ = fmt.Fprintf(writer, "digraph {\n  rankdir=LR;\n  node [fixedsize=true];\n")
-	// render the nodes
+	_, _ = fmt.Fprint(writer, graphHeader)
 	for _, state := range meta.states {
+		shape := "circle"
 		if state == start || state == end {
-			_, _ = fmt.Fprintf(writer, "  %d [shape=\"doublecircle\"];\n", state.id)
-		} else {
-			_, _ = fmt.Fprintf(writer, "  %d [shape=\"circle\"];\n", state.id)
+			shape = "doublecircle"
 		}
+		_, _ = fmt.Fprintf(writer, "  %d [shape=\"%s\"];\n", state.id, shape)
 	}
-	// render the transitions
 	for _, state := range meta.states {
-		for _, transition := range state.followStates {
-			if transition == end {
-				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"δ\"];\n", state.id, transition.id)
-			} else {
-				_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, transition.id, label(transition))
+		for _, next := range state.followStates {
+			label := rangeLabel(next.runeRange)
+			if next == end {
+				label = "δ"
 			}
-
+			_, _ = fmt.Fprintf(writer, "  %d -> %d [arrowsize=0.7, label=\"%s\"];\n", state.id, next.id, label)
 		}
 	}
 	_, _ = fmt.Fprintf(writer, "}\n")
