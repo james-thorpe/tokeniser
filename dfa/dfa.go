@@ -5,155 +5,12 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"unicode/utf8"
 )
-
-// runeRange is an inclusive range of runes low...high
-type runeRange struct {
-	low, high rune
-}
-
-func (r runeRange) contains(c rune) bool {
-	return c >= r.low && c <= r.high
-}
-
-// NFAState is a position in the NFA: it matches one rune range and lists the states that may
-// match the following rune.
-type NFAState struct {
-	id           int       // index in NFAMetadata.states; orders and keys NFA state sets in CompileDFA
-	followStates NFAStates // states that can match the rune following this one
-	runeRange              // runes this state matches; embedded so low/high are promoted
-}
-
-// NFAStates is a set of NFA states.
-type NFAStates []*NFAState
-
-// Compiler adds a grammar fragment to the NFA in meta, connecting it after prevStates, and returns
-// the states that end the fragment.
-type Compiler func(meta *NFAMetadata, prevStates NFAStates) NFAStates
-
-// NFAMetadata captured while compiling the grammar to an NFA. CompileDFA reads it to build the DFA,
-// with states[0] as the root.
-type NFAMetadata struct {
-	states NFAStates // list of all states that have been created (doubles as NFAState.id generator)
-}
 
 var (
 	ErrUnexpectedEOI   = errors.New("unexpected end of input")
 	ErrGrammarMismatch = errors.New("input does not match grammar")
 )
-
-// Range matches an input rune between low and high inclusive
-func Range(low, high rune) Compiler {
-	if low > high {
-		panic("range low is greater than high") // coding error not runtime error
-	}
-	return func(meta *NFAMetadata, prevStates NFAStates) NFAStates {
-		state := &NFAState{id: len(meta.states), runeRange: runeRange{low, high}}
-		meta.states = append(meta.states, state)
-		connect(prevStates, NFAStates{state})
-		return NFAStates{state}
-	}
-}
-
-// MatchRune matches an input rune
-func MatchRune(rn rune) Compiler {
-	return Range(rn, rn)
-}
-
-// MatchString matches the runes of text in order
-func MatchString(text string) Compiler {
-	return func(meta *NFAMetadata, prevStates NFAStates) NFAStates {
-		for _, r := range text {
-			prevStates = MatchRune(r)(meta, prevStates)
-		}
-		return prevStates
-	}
-}
-
-// Any matches any input rune
-func Any() Compiler {
-	return Range(0, utf8.MaxRune)
-}
-
-// Seq matches each of compilers in order
-func Seq(compilers ...any) Compiler {
-	return func(meta *NFAMetadata, prevStates NFAStates) NFAStates {
-		for _, compiler := range compilers {
-			prevStates = convertToCompiler(compiler)(meta, prevStates)
-		}
-		return prevStates
-	}
-}
-
-// Optional matches the sequence compilers zero or one times
-func Optional(compilers ...any) Compiler {
-	return func(meta *NFAMetadata, prevStates NFAStates) NFAStates {
-		tail := Seq(compilers...)(meta, prevStates)
-		return append(prevStates, tail...) // returning prevStates creates a bypass path
-	}
-}
-
-// OneOrMore matches the sequence compilers one or more times
-func OneOrMore(compilers ...any) Compiler {
-	return func(meta *NFAMetadata, prevStates NFAStates) NFAStates {
-		// connect gives every state in prevStates the same new followStates, so those added to
-		// prevStates[0] are the head of the fragment that the tail loops back to
-		firstHeadIx := len(prevStates[0].followStates)
-		tail := Seq(compilers...)(meta, prevStates)
-		connect(tail, prevStates[0].followStates[firstHeadIx:])
-		return tail
-	}
-}
-
-// ZeroOrMore matches the sequence compilers zero or more times
-func ZeroOrMore(compilers ...any) Compiler {
-	return Optional(OneOrMore(compilers...))
-}
-
-// Alt matches any one of alternatives
-func Alt(alternatives ...any) Compiler {
-	return func(meta *NFAMetadata, prevStates NFAStates) NFAStates {
-		tail := NFAStates{}
-		for _, alt := range alternatives {
-			tail = append(tail, convertToCompiler(alt)(meta, prevStates)...)
-		}
-		return tail
-	}
-}
-
-func convertToCompiler(obj any) Compiler {
-	switch v := obj.(type) {
-	case Compiler:
-		return v
-	case string:
-		return MatchString(v)
-	case rune:
-		return MatchRune(v)
-	default:
-		panic("unable to convert to compiler") // coding error not runtime error
-	}
-}
-
-// connect adds each destination state to the followStates of each source state, without duplicates.
-func connect(sourceStates NFAStates, destStates NFAStates) {
-	for _, source := range sourceStates {
-		for _, dest := range destStates {
-			if !slices.Contains(source.followStates, dest) {
-				source.followStates = append(source.followStates, dest)
-			}
-		}
-	}
-}
-
-// CompileNFA compiles the grammar to an NFA rooted at meta.states[0]. end is the terminal state
-// that follows the grammar; reaching it means the input matched.
-func CompileNFA(compiler Compiler) (end *NFAState, meta *NFAMetadata) {
-	meta = &NFAMetadata{}
-	// wrap the grammar in a root and a terminal state so the DFA has a single start and accept test
-	tail := Seq(Any(), compiler, rune(-1))(meta, NFAStates{})
-	return tail[0], meta
-}
 
 // disjointRange is an output range of disjointRanges and the input states whose range covers it.
 type disjointRange struct {
@@ -200,6 +57,7 @@ type DFAState struct {
 	nfaStates   NFAStates    // NFA states that may match the next rune, excluding the terminal
 	transitions []transition // sorted by low and pairwise disjoint
 	accept      bool         // input may end in this state
+	kind        int          // token kind accepted when accept is true
 }
 
 // transition is a DFA edge taken on any rune in runeRange.
@@ -213,24 +71,29 @@ type DFAMetadata struct {
 	states []*DFAState // all states, indexed by DFAState.id; states[0] is the start state
 }
 
-// CompileDFA compiles the grammar to an NFA and builds a DFA from it, rooted at the NFA's first
-// state (subset construction). Each DFA state represents the set of NFA states that may match
-// the next rune. The NFA terminal is folded into DFAState.accept, so the DFA has no -1
-// transitions. Returns all DFA states; states[0] is the start state.
+// CompileDFA compiles the whole grammar as a single token and builds a DFA from it.
+// Returns all DFA states; states[0] is the start state.
 func CompileDFA(compiler Compiler) *DFAMetadata {
-	nfaEnd, nfa := CompileNFA(compiler)
+	return buildDFA(CompileNFA(Token(0, compiler)))
+}
+
+// buildDFA builds a DFA from nfa, rooted at nfa.states[0] (subset construction). Each DFA state
+// represents the set of NFA states that may match the next rune. Token terminals are folded into
+// DFAState.accept and kind, so the DFA has no transitions for them.
+func buildDFA(nfa *NFAMetadata) *DFAMetadata {
 	dfaStates := []*DFAState{}
 	index := map[string]*DFAState{}
+	isTerminal := func(s *NFAState) bool { return s.terminal }
 	add := func(set NFAStates) *DFAState {
-		// keyed on the full set so the terminal distinguishes accepting states
+		// keyed on the full set so terminals distinguish accepting states
 		key := setKey(set)
 		if state, ok := index[key]; ok {
 			return state
 		}
-		state := &DFAState{
-			id:        len(dfaStates),
-			nfaStates: slices.DeleteFunc(slices.Clone(set), func(s *NFAState) bool { return s == nfaEnd }),
-			accept:    slices.Contains(set, nfaEnd),
+		state := &DFAState{id: len(dfaStates), nfaStates: slices.DeleteFunc(slices.Clone(set), isTerminal)}
+		// set is sorted by id and earlier tokens get lower ids, so the first terminal has priority
+		if i := slices.IndexFunc(set, isTerminal); i >= 0 {
+			state.accept, state.kind = true, set[i].kind
 		}
 		index[key] = state
 		dfaStates = append(dfaStates, state)
